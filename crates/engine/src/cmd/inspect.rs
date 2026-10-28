@@ -43,7 +43,10 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo()
         .doc_only()
         .params("→ the built-in materials, then the design's own (user: true, with their look)"),
-    CommandSpec::new("engine.commands", "List Commands", commands).icon("list").noundo(),
+    CommandSpec::new("engine.commands", "List Commands", commands)
+        .icon("list")
+        .noundo()
+        .params("filter?: substring of id, label, tab or panel → only the matching commands (used to explain a failed call)"),
 ];
 
 pub fn measure_json(b: &solidcraft_doc::ModelBody) -> Value {
@@ -319,8 +322,14 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"body": b.name, "faces": faces}))
 }
 
-fn commands(s: &mut Session, _p: &Value) -> Result<Value> {
-    Ok(Value::Array(crate::command_specs().iter().map(|c| serde_json::to_value(c.info(s)).unwrap_or_default()).collect()))
+fn commands(s: &mut Session, p: &Value) -> Result<Value> {
+    let filter = str_(p, "filter").map(str::to_lowercase).filter(|f| !f.is_empty());
+    let hit = |c: &Value| {
+        filter.as_ref().is_none_or(|f| {
+            ["id", "label", "tab", "panel"].iter().any(|k| c.get(*k).and_then(Value::as_str).is_some_and(|s| s.to_lowercase().contains(f.as_str())))
+        })
+    };
+    Ok(Value::Array(crate::command_specs().iter().map(|c| serde_json::to_value(c.info(s)).unwrap_or_default()).filter(hit).collect()))
 }
 
 fn model_threads(s: &mut Session, _p: &Value) -> Result<Value> {

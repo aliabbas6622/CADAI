@@ -42,12 +42,30 @@ pub fn vec3(v: &Value) -> Option<Vec3> {
     }
 }
 
+/// What a value looks like, so a shape error can say what arrived instead of only what was wanted.
+pub fn shape(v: &Value) -> String {
+    match v {
+        Value::Null => "null".into(),
+        Value::Bool(_) => "true or false".into(),
+        Value::Number(_) => "a number".into(),
+        Value::String(_) => "a string".into(),
+        Value::Array(a) => format!("an array of {}", a.len()),
+        Value::Object(o) => format!("an object with {}", o.keys().take(6).cloned().collect::<Vec<_>>().join(", ")),
+    }
+}
+
 pub fn req_vec2(cmd: &str, p: &Value, k: &str) -> Result<Vec2> {
-    p.get(k).and_then(vec2).ok_or_else(|| bad(cmd, format!("`{k}` must be a point [x, y]")))
+    p.get(k).and_then(vec2).ok_or_else(|| {
+        let got = p.get(k).map_or_else(|| "nothing".to_string(), shape);
+        bad(cmd, format!("`{k}` must be a point [x, y], e.g. [10, 20]; received {got}"))
+    })
 }
 
 pub fn req_vec3(cmd: &str, p: &Value, k: &str) -> Result<Vec3> {
-    p.get(k).and_then(vec3).ok_or_else(|| bad(cmd, format!("`{k}` must be a point [x, y, z]")))
+    p.get(k).and_then(vec3).ok_or_else(|| {
+        let got = p.get(k).map_or_else(|| "nothing".to_string(), shape);
+        bad(cmd, format!("`{k}` must be a point [x, y, z], e.g. [10, 20, 0]; received {got}"))
+    })
 }
 
 pub fn vec2_list(cmd: &str, p: &Value, k: &str, max: usize) -> Result<Vec<Vec2>> {

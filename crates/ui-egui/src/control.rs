@@ -1127,6 +1127,31 @@ mod tests {
     /// #743: a batch is one request through the app's queue, answered within a frame, however
     /// many steps it has.
     #[test]
+    fn progressive_commands_leave_a_frame_for_each_model_state() {
+        let mut h = crate::scenario::Harness::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        h.app.control_rx = Some(rx);
+        let mut replies = Vec::new();
+        for x in [0, 20] {
+            let (req, reply) = ControlRequest::new(
+                "engine.execute",
+                json!({
+                    "command": "solid.box", "params": {"length": 10, "width": 10, "height": 10, "corner": [x, 0, 0]}, "present": true
+                }),
+            );
+            tx.send(req).unwrap();
+            replies.push(reply);
+        }
+        h.frame();
+        assert_eq!(replies[0].try_recv().unwrap()["ok"], true);
+        assert!(matches!(replies[1].try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        assert_eq!(h.app.session.world_state().bodies.len(), 1);
+        h.frame();
+        assert_eq!(replies[1].try_recv().unwrap()["ok"], true);
+        assert_eq!(h.app.session.world_state().bodies.len(), 2);
+    }
+
+    #[test]
     fn engine_batch_runs_in_one_frame() {
         let mut h = crate::scenario::Harness::new();
         let steps: Vec<_> = (0..40)

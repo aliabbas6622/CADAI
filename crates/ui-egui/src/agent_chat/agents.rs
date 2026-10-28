@@ -94,7 +94,7 @@ impl Entry {
             login: "",
             found: false,
             base_url: c.base_url.clone(),
-            model: c.model.clone(),
+            model: api_model_id(&c.base_url, &c.model).to_string(),
             key: c.key,
         }
     }
@@ -141,7 +141,7 @@ pub fn current(app: &crate::SolveApp) -> Option<Entry> {
 
 /// The permission mode for an agent: its own, else the global one.
 pub fn mode_for(p: &crate::prefs::Prefs, id: &str) -> Mode {
-    p.agent_permissions.get(id).copied().unwrap_or(p.ai_permissions)
+    if p.ai_full_mode { Mode::All } else { p.agent_permissions.get(id).copied().unwrap_or(p.ai_permissions) }
 }
 
 /// Whether `tool` is always allowed for `agent`.
@@ -162,12 +162,20 @@ pub fn new_id(p: &crate::prefs::Prefs, prefix: &str) -> String {
     (1..).map(|n| format!("{prefix}-{n}")).find(|id| !p.agents.iter().any(|a| &a.id == id)).unwrap_or_else(|| prefix.to_string())
 }
 
-/// OpenAI-compatible endpoints people use: name, base URL, whether it needs a key.
-pub const API_PRESETS: &[(&str, &str, bool)] = &[
-    ("Ollama", "http://localhost:11434/v1", false),
-    ("LM Studio", "http://localhost:1234/v1", false),
-    ("OpenAI", "https://api.openai.com/v1", true),
+/// OpenAI-compatible endpoints: name, base URL, whether it needs a key, suggested model.
+pub const API_PRESETS: &[(&str, &str, bool, &str)] = &[
+    ("Ollama", "http://localhost:11434/v1", false, ""),
+    ("LM Studio", "http://localhost:1234/v1", false, ""),
+    ("OpenAI", "https://api.openai.com/v1", true, ""),
+    ("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", true, "gemini-3.8-flash"),
+    ("Groq", "https://api.groq.com/openai/v1", true, "qwen/qwen3.8-27b"),
+    ("OpenRouter", "https://openrouter.ai/api/v1", true, "minimax/minimax-m3.1-flash:free"),
 ];
+
+/// Gemini's model list uses `models/` names, while its chat endpoint takes bare IDs.
+pub fn api_model_id<'a>(base_url: &str, model: &'a str) -> &'a str {
+    if base_url.starts_with("https://generativelanguage.googleapis.com/") { model.strip_prefix("models/").unwrap_or(model) } else { model }
+}
 
 /// Whether a key may be sent to `url`: only over HTTPS, or to this computer.
 pub fn key_safe_for(url: &str) -> bool {
@@ -230,5 +238,16 @@ mod tests {
         assert_eq!(new_id(&p, "api"), "api-2");
         assert_eq!(normalize_url(" http://localhost:11434/v1/ ").as_deref(), Ok("http://localhost:11434/v1"));
         assert!(normalize_url("localhost:11434").is_err());
+    }
+
+    #[test]
+    fn saved_gemini_model_uses_chat_id() {
+        let c = AgentConfig {
+            kind: Kind::Api,
+            base_url: "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+            model: "models/gemini-3.8-flash".into(),
+            ..Default::default()
+        };
+        assert_eq!(Entry::from_config(&c).model, "gemini-3.8-flash");
     }
 }

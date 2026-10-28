@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use solidcraft_doc::{Feature, FeatureKind};
 
 use super::CommandSpec;
-use crate::params::{bad, bool_, num, str_, string_list};
+use crate::params::{bad, bool_, num, str_};
 use crate::{EngineError, Result, Sel, Session, Snapshot};
 
 pub static COMMANDS: &[CommandSpec] = &[
@@ -127,30 +127,34 @@ fn compute_all(s: &mut Session, _p: &Value) -> Result<Value> {
     Ok(json!({"features": s.model.results.len(), "errors": errors}))
 }
 
+/// A feature reference as the model may send it: an id, a name, or an object with one of them
+/// (`{"name": "Spire"}` is what a model produces when it copies a timeline row).
+fn feature_key(v: &Value) -> Option<String> {
+    match v {
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Value::Object(o) => o.get("id").or_else(|| o.get("name")).and_then(feature_key),
+        _ => None,
+    }
+}
+
 fn feature_id(s: &Session, v: Option<&Value>, cmd: &str) -> Result<u64> {
-    let key = match v {
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::String(x)) => x.clone(),
-        _ => return Err(bad(cmd, "`feature` must be an id or name")),
-    };
+    let key = v.and_then(feature_key).ok_or_else(|| bad(cmd, "`feature` must be an id or name, e.g. \"Spire\" (or {\"name\": \"Spire\"})"))?;
     s.doc.find_feature(&key).map(|f| f.id).ok_or_else(|| bad(cmd, format!("no feature `{key}`")))
 }
 
 fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "timeline.delete";
-    let mut keys = string_list(p, "features");
-    if let Some(Value::Array(a)) = p.get("features") {
-        keys.extend(a.iter().filter_map(Value::as_u64).map(|n| n.to_string()));
-    }
+    let mut keys: Vec<String> = match p.get("features") {
+        Some(Value::Array(a)) => a.iter().filter_map(feature_key).collect(),
+        Some(one) => feature_key(one).into_iter().collect(),
+        None => Vec::new(),
+    };
     if let Some(f) = p.get("feature") {
-        keys.push(match f {
-            Value::Number(n) => n.to_string(),
-            Value::String(x) => x.clone(),
-            _ => String::new(),
-        });
+        keys.extend(feature_key(f));
     }
     if keys.is_empty() {
-        return Err(bad(cmd, "`features` must list features"));
+        return Err(bad(cmd, "`features` must be a flat list of feature ids or names, e.g. {\"features\":[\"Spire\"]}; a single name works too"));
     }
     // Features that work now; any of them failing after the delete is reported (a later
     // feature that names a deleted body, #267).
@@ -544,8 +548,10 @@ fn feature_ids(s: &Session, p: &Value, cmd: &str) -> Result<Vec<u64>> {
         None | Some(Value::Null) => {}
         Some(Value::Array(a)) if a.len() <= 10_000 => given.extend(a),
         Some(Value::Array(_)) => return Err(bad(cmd, "too many features")),
-        Some(one @ (Value::Number(_) | Value::String(_))) => given.push(one),
-        Some(_) => return Err(bad(cmd, "`features` must be a list of feature ids or names")),
+        Some(one) if feature_key(one).is_some() => given.push(one),
+        Some(_) => {
+            return Err(bad(cmd, "`features` must be a flat list of feature ids or names, e.g. {\"features\":[\"Spire\"]}; a single name works too"));
+        }
     }
     if given.is_empty() {
         return Err(bad(cmd, "`feature` (id or name) or `features` (a list of them) must name a feature"));
@@ -578,6 +584,39 @@ fn suppress(s: &mut Session, p: &Value) -> Result<Value> {
     match ids.as_slice() {
         [id] if p.get("features").is_none_or(Value::is_null) => Ok(json!({"feature": id, "suppressed": want})),
         _ => Ok(json!({"features": ids, "suppressed": want})),
+    }
+}
+
+/// Convert `{x, y, z}` and `{x, y}` maps whose members are all numbers to `[x, y, z]` and
+/// `[x, y]` throughout a feature definition. Only that exact all-number shape converts, so an
+/// object that really is an object is left for serde to check.
+fn points_as_arrays(v: &mut Value) {
+    match v {
+        Value::Object(o) => {
+            let point = |keys: &[&str]| -> Option<Value> {
+                keys.iter()
+                    .all(|k| o.get(*k).is_some_and(Value::is_number))
+                    .then(|| Value::Array(keys.iter().map(|k| o.get(*k).cloned().unwrap_or(Value::Null)).collect()))
+            };
+            let arr = match o.len() {
+                3 => point(&["x", "y", "z"]),
+                2 => point(&["x", "y"]),
+                _ => None,
+            };
+            if let Some(arr) = arr {
+                *v = arr;
+                return;
+            }
+            for child in o.values_mut() {
+                points_as_arrays(child);
+            }
+        }
+        Value::Array(a) => {
+            for child in a {
+                points_as_arrays(child);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -945,7 +984,12 @@ fn edit_feature(s: &mut Session, p: &Value) -> Result<Value> {
     let set = &numbers_as_expressions(command_profiles(&set, cmd)?, &before);
     let mut v = before.clone();
     merge(&mut v, set, 0);
-    let mut nf: Feature = serde_json::from_value(v.clone()).map_err(|e| bad(cmd, format!("invalid feature: {e}")))?;
+    // Points are stored as arrays; a map with x/y(/z) is the same point, so accept it before
+    // parsing rather than failing with "invalid type: map, expected an array of length 3".
+    points_as_arrays(&mut v);
+    let mut nf: Feature = serde_json::from_value(v.clone()).map_err(|e| {
+        bad(cmd, format!("invalid feature: {e}; `set` takes the definition fields shown by timeline.inspect, with points as [x, y, z]"))
+    })?;
     nf.id = f.id;
     if let (FeatureKind::Extrude { extent: old, .. }, FeatureKind::Extrude { extent: new, .. }) = (&f.kind, &mut nf.kind)
         && old.direction != solidcraft_doc::Direction::Symmetric

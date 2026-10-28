@@ -177,7 +177,7 @@ impl Backend for Remote {
             msg["token"] = json!(t);
         }
         let line = msg.to_string();
-        let reply = if method == "engine.batch" {
+        let reply = if method == "engine.batch" || (method == "engine.execute" && msg["params"]["present"] == true) {
             self.send_batch(&line)
         } else {
             // One retry on a fresh connection (the app may have restarted). When nothing listens

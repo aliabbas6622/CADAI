@@ -24,6 +24,16 @@ fn new_sketch() -> Session {
     s
 }
 
+#[test]
+fn circle_accepts_radius_expressions() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": "5"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [15, 0], "radius": "5mm"}));
+    let sk = sketch(&s);
+    assert_eq!(sk.curves.len(), 2);
+    assert!(s.execute("sketch.circle.center", &json!({"center": [0, 0], "radius": "NaN"})).is_err());
+}
+
 // ---------------------------------------------------------------------------------------------
 // Dimensions
 

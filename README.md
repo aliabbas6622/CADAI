@@ -91,8 +91,8 @@ More commands, the Windows cross-build and the browser build are in [docs/buildi
 
 `solidcraft-cli mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server. Headless it
 runs its own design session, or with `--connect` it drives the running app so you can watch.
-Claude Code: `claude mcp add solidcraft -- solidcraft-cli mcp`. Tools, access rules and an
-example session: [docs/mcp.md](docs/mcp.md).
+Claude Code: `claude mcp add solidcraft -- solidcraft-cli mcp`. See the [assistant tool list](tools.md),
+[sidebar guide](docs/agent-chat.md), and [MCP reference](docs/mcp.md).
 
 ## Scripts
 

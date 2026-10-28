@@ -1033,6 +1033,7 @@
   "ui.ai_no_answer": "智能体未及时响应",
   "ui.ai_no_http": "此版本无法访问 API 端点",
   "ui.ai_no_keychain": "系统钥匙串不可用，无法保存密钥。无需密钥的本地服务器仍可使用。",
+  "ui.ai_no_progress": "已停止：模型重复了相同的工具调用三次，设计未更改；请发送另一条消息以继续",
   "ui.ai_panel": "面板",
   "ui.ai_permissions": "权限",
   "ui.ai_preset": "预设",

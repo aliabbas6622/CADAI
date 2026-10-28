@@ -32,20 +32,35 @@ when you send a message or press **Connect**.
 
 ## The panel
 
-- **Docking:** drag the panel's header (the dotted grip and the title) to the other half of the
+The compact header keeps New chat, Close and an **⋯** options menu visible. The menu
+holds agent/model selection, connection controls, docking and Preferences. The **+**
+menu beside the prompt holds attachments and **Attach view**. Sending starts the selected
+agent automatically; agent setup appears only when no agent is available.
+
+Enable **Full AI mode** in **⋯** or Preferences → AI for automatic approval of agent
+actions, including save, overwrite, export and design replacement. Leaving the mode restores
+previous global and per-agent permissions. Existing folder, turn and crash-report limits
+still apply; an external agent's own mode can impose additional restrictions.
+
+**Thinking** displays reasoning text supplied by the provider in an expandable section.
+Providers that do not expose reasoning still show their actual tool activity. Consecutive
+tool calls fold into a compact activity group, with live spinners and expandable results.
+The disclosure animation uses the application's existing egui animation settings.
+
+- **Docking:** drag the panel's title to the other half of the
   window and let go. The side it would land on lights up while you drag. You can also pick
   **Left** or **Right** under Preferences → AI → Panel. SolidCraft remembers the side.
 - **Width:** drag the panel's inner edge. SolidCraft remembers it.
-- **Its own window:** the pop-out button in the header (a window with an arrow) moves the chat
+- **Its own window:** the pop-out action in **⋯** moves the chat
   into a window of its own, named after the design, which you can move anywhere, including
   another screen. The window's own close button closes the chat, which opens there again next
-  time; **Dock** (the same place in its header) puts it back in the side panel. You can also
+  time; **Dock** (in **⋯**) puts it back in the side panel. You can also
   pick **Own window** under Preferences → AI → Panel. SolidCraft remembers where the window
   was and how big.
-- **Minimise** (the line in the header) folds the panel into a thin strip that keeps the chat
+- **Minimise** (in **⋯**) folds the panel into a thin strip that keeps the chat
   icon, the agent's state, and a count of anything waiting for your answer. Click the icon to
   unfold it. **Close** (×) hides the panel. Neither stops the agent; **Stop** does.
-- **The agent switcher** under the title picks the agent for this conversation; switching stops
+- **The agent switcher** in **⋯** picks the agent for this conversation; switching stops
   the one running. Next to it, when the agent has modes of its own (Claude Code has *Default*,
   *Accept Edits*, *Plan*…), a second drop-down sets the agent's mode. When the agent reports its models (an ACP agent's
   model list, or an endpoint's `/models`), a model drop-down shows the one in use and changes it;
@@ -162,12 +177,70 @@ Grok Build also supports `XAI_API_KEY` for users who choose API authentication.
 - **Custom command:** any other program that speaks ACP on stdin and stdout, such as
   `my-agent --acp`. SolidCraft starts it directly, not through a shell.
 - **OpenAI-compatible API:** a preset (Ollama `http://localhost:11434/v1`, LM Studio
-  `http://localhost:1234/v1`, OpenAI) or a custom URL, the model name, and an optional key.
+  `http://localhost:1234/v1`, OpenAI, Gemini) or a custom URL, the model name, and an optional key.
+  For Gemini, get a key from Google AI Studio, select the Gemini preset, and enter it in the
+  masked API key field. The preset fills in Google's compatible endpoint and a suggested model.
   The key goes into the system keychain (Keychain on macOS, Credential Manager on Windows, the
   Secret Service on Linux) and is only ever sent over HTTPS or to this computer. **Test** asks the
   endpoint for its models. For these agents SolidCraft runs the conversation itself, with the
   same tools, limits and questions as for a coding agent, and at most 24 model requests per
   message.
+
+API answers stream into the conversation as they arrive. Each model request shows a live
+waiting/receiving card; expand it for total and first-response times. Tool cards show their
+arguments while running, then their result and duration. The header shows the elapsed time for
+the whole message. Agents are asked to give short action updates with their tool calls.
+Request details include first text token time, an input size estimate, and provider-reported
+input/output/cached tokens when available. A completed turn reports its model round-trip count.
+
+An HTTP 429 retries the rejected model request at most twice, with a visible wait message.
+Google's structured retry delay is honored up to 30 seconds per wait; otherwise the waits are
+two and four seconds. Explicit daily or zero quotas stop immediately. Stop cancels the wait;
+completed modeling commands are not repeated. Provider error details also appear for responses
+wrapped in a JSON array. Retrying does not increase an account's provider quota.
+
+The API backend loads the command index once, with parameter docs for common operations and
+exact-command lookup for others. Lookups are answered inside the app from that index: an
+unfiltered lookup returns every id (about 8 KB; the catalog itself is about 200 KB, which the
+tool-result cap would cut to a few-kilobyte preview of its first commands), a filtered one the
+matching ids, labels and parameter docs, and a lookup repeated in the same turn is answered from
+that first result. A fresh design snapshot accompanies each user message.
+Each group of successful edits is followed by one measured design snapshot, including timeline
+warnings. The model compares this with the requested result before continuing. Imports, redo
+and design replacement also trigger verification. Host observations never split a user turn
+when old history is trimmed.
+A message whose rounds only repeat earlier reads and change nothing stops after the third, so a
+model stuck in a lookup loop cannot spend the whole request budget on it.
+Old conversation turns are dropped as whole units at the history budget, preserving tool pairs.
+
+The desktop host reuses HTTP connections between tool rounds. Requests to Gemini 3/4 and OpenRouter
+use low reasoning effort for a more responsive interactive loop. OpenRouter requests `reasoning.effort: "low"`
+instead of leaving thinking depth at the model's default. Provider load and network errors still affect
+response time; streaming makes progress visible without waiting for the full answer.
+For Gemini 3, sufficiently large static instructions and tool definitions are submitted to a
+five-minute explicit cache in the background. Conversation/design data is excluded. Chat proceeds
+without waiting; small prompts and unsupported/refused caches use the normal stable prefix.
+Cache storage uses the provider's normal billing. Request details distinguish sending a cache
+reference from provider-reported cached tokens. A rejected reference retries once without it.
+Tool arguments are assembled and validated before execution; interrupted streams never execute
+partial calls.
+
+The desktop API backend runs modeling batches progressively: each completed command gives the
+viewport a frame to show its result before the next command runs. Text streams as the provider
+sends it. Geometry updates at completed command boundaries; a single expensive geometry operation
+still has to finish before its result is shown. Failed batches retain their normal rollback behavior.
+
+Named parameters must be created successfully with `set_parameter` before geometry expressions
+reference them. A batch reporting `rolled_back:true` undoes every change in that batch, including
+parameter definitions; corrected retries must include those definitions again. Box placement uses
+three coordinates, for example `"corner": [0, 0, 0]`.
+
+Structured tool results use the official Rust [TOON](https://github.com/toon-format/toon-rust)
+encoder when its output, including the format marker, is smaller than compact JSON. Other
+results use compact JSON or their original text. This changes the model's context, while the
+API/MCP protocol and command schemas remain JSON. Explicitly `TOON:`-marked argument text is
+strictly decoded to an object before the normal tool gate. Large results have an explicit,
+parseable truncation envelope; they never masquerade as complete TOON tables.
 
 ## Signing in
 
@@ -191,12 +264,19 @@ The agent reaches the open design only through SolidCraft's own tools (the
 
 - **Read the design:** list commands, inspect features, sketches and parameters, measure,
   take pictures of the view.
+- **Read a workflow:** the MCP `guide` tool gives modeling, editing and verification steps to
+  every connected agent, even when its client has not installed SolidCraft's Agent Skills.
+- **Calculate:** `calculate` checks arithmetic and unit conversions locally, in batches of up to
+  20 expressions, without changing the design.
+- **Catch malformed calls:** for common rectangle, circle, line, box and cylinder commands,
+  Full AI mode checks parameter shapes before calling the app and gives the expected field shape.
 - **Change the design:** run any modelling command, alone or in a batch. Changes show in the
   window as they happen.
 - **One undo per message:** everything the agent changes while answering one message becomes
   a single undo step, named after your message. The conversation shows *N changes, one undo
   step* with **Undo these changes** while nothing else has happened since.
-- **Tool cards:** each tool call shows as a card with its state; click it to see what it returned.
+- **Tool cards:** each tool call shows as a card with a live spinner and its state; click it to
+  see the arguments, result and elapsed time (API agents), or the details its ACP agent reports.
 - **Formatted text:** the agent's answers show as Markdown: headings, lists, quotes, code blocks
   (with **Copy**), bold, italic, `code` and links (web links only; each link is a button that opens
   it in your browser). What you type, and the agent's thoughts, stay plain text.
@@ -234,6 +314,14 @@ What counts as "a command given a file name": a parameter that holds a file or f
 a leading dot or a known extension), or any value of those in a command that exports, imports,
 saves, opens or inserts. A sweep's or pattern's `path` (curve ids) and an occurrence's `path`
 (ids) are geometry and run without a question.
+
+The shared agent prompt specifies native JSON tool calls, ordered dependencies and concise
+evidence in the final reply. Agents can use the host's current snapshot and verification
+instead of repeating reads; the guide is needed only for an unfamiliar workflow. The API
+backend defaults edit results to compact output, marks each model-facing tool reply with
+`status: ok` or `status: error`, and invalidates cached measurements immediately after sent
+edits, including failed edits whose outcome may be uncertain. See
+[agent efficiency](agent-efficiency.md) for research, scope and numerical examples.
 
 ## What it can't do
 

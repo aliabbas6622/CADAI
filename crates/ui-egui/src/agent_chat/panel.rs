@@ -434,81 +434,86 @@ fn strip(app: &mut SolveApp, ui: &mut egui::Ui) {
     }
 }
 
-/// The header: a grip to drag the panel to the other side, the title and state, Connect or Stop,
-/// Pop out (or Dock, in its own window), Minimise and Close. In its own window the system moves
-/// and minimises it, so there is no grip and no Minimise.
+/// Compact header with setup and window controls in the overflow menu.
 fn header(app: &mut SolveApp, ui: &mut egui::Ui, left: bool) {
     let t = Tokens::get();
-    let state = app.agent_chat.state();
     let popped = app.preferences.agent_chat_popped;
     ui.horizontal(|ui| {
-        let title = {
-            let (grip, _) = ui.allocate_exact_size(vec2(if popped { 0.0 } else { 10.0 }, 18.0), Sense::hover());
-            if !popped {
-                for row in 0..3 {
-                    for col in 0..2 {
-                        ui.painter().circle_filled(grip.left_top() + vec2(2.5 + col as f32 * 5.0, 4.0 + row as f32 * 5.0), 1.1, t.text_dim);
-                    }
-                }
-            }
-            let l = ui.label(RichText::new(tr("ui.agent_chat")).strong().size(14.0));
-            grip.union(l.rect)
-        };
-        let mut s = state.label().to_string();
-        if let Some(turn) = &app.agent_chat.turn
-            && state == State::Busy
-        {
-            let limit = app.preferences.agent_chat_turn_limit;
-            s = format!("{s} {}", trf("ui.agent_chat_changes_of", &[("n", &turn.changes.to_string()), ("limit", &limit.to_string())]));
-        }
-        ui.label(RichText::new(s).color(state_color(state)).small());
-        // Drag the header across the window to dock on the other side.
-        if !popped {
-            let drag = ui.interact(title, Id::new("sc_agent_chat_grip"), Sense::drag());
-            crate::scenario::publish_handle("agent_chat:grip", title.center());
-            dock_drag(app, ui, &drag, left);
-        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if glyph_button(ui, "close", tr("ui.agent_chat_close")).clicked() {
                 app.agent_chat.open = false;
             }
-            if !popped && glyph_button(ui, "minimize", tr("ui.agent_chat_minimize")).clicked() {
-                app.preferences.agent_chat_minimized = true;
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            if glyph_button(
-                ui,
-                "newchat",
-                &format!("{} ({})", tr("ui.agent_chat_new"), if cfg!(target_os = "macos") { "Cmd+Shift+L" } else { "Ctrl+Shift+L" }),
-            )
-            .clicked()
-            {
-                request_new_chat(app);
-            }
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let (kind, tip) = if popped { ("dock", "ui.agent_chat_dock") } else { ("pop_out", "ui.agent_chat_pop_out") };
-                if glyph_button(ui, kind, tr(tip)).clicked() {
-                    app.preferences.agent_chat_popped = !popped;
-                }
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let b = if state.running() {
-                    ui.button(tr("ui.agent_chat_stop")).on_hover_text(tr("ui.agent_chat_stop_tip"))
-                } else {
-                    ui.button(tr("ui.agent_chat_connect"))
-                };
-                crate::scenario::publish_handle("agent_chat:connect", b.rect.center());
-                if b.clicked() {
-                    if state.running() {
-                        disconnect(app);
-                    } else {
-                        connect(app, ui.ctx());
+                let menu = ui.menu_button("⋯", |ui| {
+                    ui.set_min_width(240.0);
+                    let mode = ui.checkbox(&mut app.preferences.ai_full_mode, tr("ui.ai_full_mode"));
+                    crate::scenario::publish_handle("agent_chat:full_mode", mode.rect.center());
+                    mode.on_hover_text(tr("ui.ai_full_mode_note"));
+                    ui.separator();
+                    switcher(app, ui);
+                    let running = app.agent_chat.state().running();
+                    let button = ui.button(tr(if running { "ui.agent_chat_stop" } else { "ui.agent_chat_connect" }));
+                    crate::scenario::publish_handle("agent_chat:connect", button.rect.center());
+                    if button.clicked() {
+                        if running {
+                            disconnect(app);
+                        } else {
+                            connect(app, ui.ctx());
+                        }
+                        ui.close();
                     }
+                    let dock = ui.button(tr(if popped { "ui.agent_chat_dock" } else { "ui.agent_chat_pop_out" }));
+                    crate::scenario::publish_handle(if popped { "agent_chat:dock" } else { "agent_chat:pop_out" }, dock.rect.center());
+                    if dock.clicked() {
+                        app.preferences.agent_chat_popped = !popped;
+                        ui.close();
+                    }
+                    if !popped && ui.button(tr("ui.agent_chat_minimize")).clicked() {
+                        app.preferences.agent_chat_minimized = true;
+                        ui.close();
+                    }
+                    if ui.button(tr("ui.ai_settings")).clicked() {
+                        crate::prefs::open_at(app, crate::prefs::PAGE_AI);
+                        ui.close();
+                    }
+                });
+                crate::scenario::publish_handle("agent_chat:options", menu.response.rect.center());
+                menu.response.on_hover_text(tr("ui.ai_options"));
+                if glyph_button(ui, "newchat", tr("ui.agent_chat_new")).clicked() {
+                    request_new_chat(app);
                 }
             }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let title = ui.add(
+                    egui::Label::new(
+                        RichText::new(tr(if app.preferences.ai_full_mode { "ui.ai_full_mode" } else { "ui.agent_chat" })).strong().size(14.0),
+                    )
+                    .truncate(),
+                );
+                if !popped {
+                    let drag = ui.interact(title.rect, Id::new("sc_agent_chat_grip"), Sense::drag());
+                    crate::scenario::publish_handle("agent_chat:grip", title.rect.center());
+                    dock_drag(app, ui, &drag, left);
+                }
+            });
         });
+    });
+    let state = app.agent_chat.state();
+    ui.horizontal(|ui| {
+        if matches!(state, State::Busy | State::Starting) {
+            ui.add(egui::Spinner::new().size(12.0).color(t.accent));
+        }
+        ui.label(RichText::new(state.label()).small().color(state_color(state)));
+        if let Some(turn) = &app.agent_chat.turn
+            && state == State::Busy
+        {
+            ui.label(RichText::new(format!("{:.0}s", (app.now - turn.started).max(0.0))).small().color(t.text_dim));
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        if let Some(agent) = agents::current(app) {
+            ui.add(egui::Label::new(RichText::new(agent.name).small().color(t.text_dim)).truncate());
+        }
     });
 }
 
@@ -553,8 +558,6 @@ fn dock_drag(app: &mut SolveApp, ui: &egui::Ui, drag: &egui::Response, left: boo
 
 fn body(app: &mut SolveApp, ui: &mut egui::Ui, left: bool) {
     header(app, ui, left);
-    #[cfg(not(target_arch = "wasm32"))]
-    switcher(app, ui);
     #[cfg(target_arch = "wasm32")]
     {
         ui.label(tr("ui.agent_chat_desktop_only"));
@@ -586,7 +589,9 @@ fn desktop_body(app: &mut SolveApp, ui: &mut egui::Ui) {
             });
         });
     }
-    picker(app, ui);
+    if agents::entries(app).is_empty() {
+        picker(app, ui);
+    }
     if state == State::NeedsAuth {
         auth_box(app, ui);
     }
@@ -646,13 +651,6 @@ fn desktop_body(app: &mut SolveApp, ui: &mut egui::Ui) {
             crate::scenario::publish_handle("agent_chat:send", send_b.rect.center());
             send_clicked = send_b.clicked();
             stop_clicked = busy && glyph_button(ui, "stopturn", tr("ui.agent_chat_stop_turn_tip")).clicked();
-            // A picture of the view goes with the message to agents that take pictures.
-            let images = app.agent_chat.images || !state.running();
-            let attach = ui
-                .add_enabled(images, egui::Checkbox::new(&mut app.agent_chat.attach_view, tr("ui.agent_chat_attach_view")))
-                .on_hover_text(tr("ui.agent_chat_attach_view_tip"))
-                .on_disabled_hover_text(tr("ui.agent_chat_no_images"));
-            crate::scenario::publish_handle("agent_chat:attach", attach.rect.center());
         });
     });
     egui::ScrollArea::vertical()
@@ -935,7 +933,11 @@ fn conversation(app: &mut SolveApp, ui: &mut egui::Ui) {
     let mut undo: Option<usize> = None;
     let mut open_gallery: Option<Gallery> = None;
     let current_doc = app.session.doc.clone();
+    let mut grouped_until = 0;
     for (n, item) in app.agent_chat.items.iter().enumerate() {
+        if n < grouped_until {
+            continue;
+        }
         match item {
             Item::User { text, image, pictures, files } => {
                 ui.add_space(6.0);
@@ -957,13 +959,47 @@ fn conversation(app: &mut SolveApp, ui: &mut egui::Ui) {
             }
             Item::Agent { thought, text } => {
                 if *thought {
-                    ui.add(egui::Label::new(RichText::new(text).italics().color(t.text_dim)).selectable(true).wrap());
+                    let thinking = egui::CollapsingHeader::new(RichText::new(tr("ui.ai_thinking")).color(t.text_dim))
+                        .id_salt(("sc_agent_thinking", n))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().id_salt(("sc_agent_thinking_text", n)).max_height(200.0).show(ui, |ui| {
+                                ui.add(egui::Label::new(RichText::new(text).color(t.text_dim)).selectable(true).wrap());
+                            });
+                        });
+                    crate::scenario::publish_handle(&format!("agent_chat:thinking:{n}"), thinking.header_response.rect.center());
                 } else {
                     super::markdown_view::show(ui, n, text);
                 }
             }
-            Item::Tool { title, kind, status, output, .. } => {
-                tool_card(ui, n, title, kind, *status, output.as_deref());
+            Item::Tool { .. } => {
+                let group: Vec<_> =
+                    app.agent_chat.items.iter().enumerate().skip(n).take_while(|(_, item)| matches!(item, Item::Tool { .. })).collect();
+                grouped_until = n + group.len();
+                let active = group.iter().rev().find_map(|(_, item)| match item {
+                    Item::Tool { title, status: None | Some(ToolStatus::InProgress | ToolStatus::Pending), .. } => Some(title.as_str()),
+                    _ => None,
+                });
+                let failed = group.iter().any(|(_, item)| matches!(item, Item::Tool { status: Some(ToolStatus::Failed), .. }));
+                let label = active
+                    .map(str::to_string)
+                    .unwrap_or_else(|| trf(if failed { "ui.ai_activity_failed" } else { "ui.ai_activity_done" }, &[("n", &group.len().to_string())]));
+                ui.horizontal(|ui| {
+                    if active.is_some() {
+                        ui.add(egui::Spinner::new().size(12.0).color(t.accent));
+                    }
+                    let response = egui::CollapsingHeader::new(RichText::new(label).color(if failed { t.error } else { t.text_dim }))
+                        .id_salt(("sc_agent_activity", n))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for (index, item) in &group {
+                                if let Item::Tool { title, kind, status, output, .. } = item {
+                                    tool_card(ui, *index, title, kind, *status, output.as_deref());
+                                }
+                            }
+                        });
+                    crate::scenario::publish_handle(&format!("agent_chat:activity:{n}"), response.header_response.rect.center());
+                });
             }
             Item::Plan(entries) => {
                 for (c, s) in entries {
@@ -973,7 +1009,11 @@ fn conversation(app: &mut SolveApp, ui: &mut egui::Ui) {
                         _ => (t.text_dim, false),
                     };
                     ui.horizontal(|ui| {
-                        status_dot(ui, color, filled);
+                        if s == "in_progress" {
+                            ui.add(egui::Spinner::new().size(10.0).color(color));
+                        } else {
+                            status_dot(ui, color, filled);
+                        }
                         ui.label(RichText::new(c).color(t.text_dim));
                     });
                 }
@@ -1132,9 +1172,9 @@ fn conversation(app: &mut SolveApp, ui: &mut egui::Ui) {
     }
     if app.agent_chat.items.is_empty() && app.agent_chat.pending.is_empty() {
         ui.add_space(12.0);
-        ui.label(RichText::new(tr("ui.agent_chat_intro")).color(t.text_dim));
-        ui.add_space(6.0);
-        ui.label(RichText::new(tr("ui.agent_chat_privacy")).color(t.text_dim).size(11.0));
+        ui.label(RichText::new(tr("ui.ai_welcome")).strong().size(18.0).color(t.text));
+        ui.add_space(8.0);
+        ui.add(egui::Label::new(RichText::new(tr("ui.ai_welcome_note")).color(t.text_dim)).wrap());
     }
     if let Some((n, text)) = edit_done {
         if let (Some(text), Some(p)) = (text.filter(|t| !t.trim().is_empty()), app.agent_chat.pending.get_mut(n)) {
@@ -1327,6 +1367,9 @@ fn chip(ui: &mut egui::Ui, thumbs: &mut std::collections::HashMap<u64, egui::Tex
 fn add_menu(app: &mut SolveApp, ui: &mut egui::Ui) {
     let (mut choose, mut paste) = (false, false);
     let r = ui.menu_button(RichText::new("+").strong().size(15.0), |ui| {
+        let images = app.agent_chat.images || !app.agent_chat.state().running();
+        ui.add_enabled(images, egui::Checkbox::new(&mut app.agent_chat.attach_view, tr("ui.agent_chat_attach_view")));
+        ui.separator();
         let a = ui.button(tr("ui.agent_chat_add_file"));
         crate::scenario::publish_handle("agent_chat:add_file", a.rect.center());
         let b = ui.button(tr("ui.agent_chat_paste_picture"));
@@ -1366,43 +1409,44 @@ fn tool_card(ui: &mut egui::Ui, n: usize, title: &str, kind: &str, status: Optio
         Some(ToolStatus::InProgress) => (t.warning, true, "ui.ai_tool_running"),
         _ => (t.text_dim, false, "ui.ai_tool_waiting"),
     };
-    egui::Frame::NONE.fill(t.toolbar).stroke(Stroke::new(1.0, t.border)).corner_radius(6.0).inner_margin(egui::Margin::symmetric(6, 3)).show(
-        ui,
-        |ui| {
-            ui.set_width(ui.available_width());
-            let id = ui.make_persistent_id(("sc_agent_tool", n));
-            let mut state_ = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
-            let head = ui.horizontal(|ui| {
+    egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 3)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let id = ui.make_persistent_id(("sc_agent_tool", n));
+        let mut state_ = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        let head = ui.horizontal(|ui| {
+            if status == Some(ToolStatus::InProgress) {
+                ui.add(egui::Spinner::new().size(10.0).color(color));
+            } else {
                 status_dot(ui, color, filled);
-                // The state and kind keep their room at the right; the title is cut short before them.
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(tr(state)).size(10.5).color(color));
-                    if !kind.is_empty() && kind != "other" {
-                        ui.label(RichText::new(kind).size(10.5).color(t.text_dim));
-                    }
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.add(egui::Label::new(RichText::new(title).monospace().size(11.5).color(t.text)).truncate()).on_hover_text(title);
-                    });
+            }
+            // The state and kind keep their room at the right; the title is cut short before them.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(tr(state)).size(10.5).color(color));
+                if !kind.is_empty() && kind != "other" {
+                    ui.label(RichText::new(kind).size(10.5).color(t.text_dim));
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(title).size(11.5).color(t.text)).truncate()).on_hover_text(title);
                 });
             });
-            let click = ui.interact(head.response.rect, id.with("head"), Sense::click());
-            crate::scenario::publish_handle(&format!("agent_chat:tool:{n}"), head.response.rect.center());
-            if output.is_some() && click.clicked() {
-                state_.toggle(ui);
+        });
+        let click = ui.interact(head.response.rect, id.with("head"), Sense::click());
+        crate::scenario::publish_handle(&format!("agent_chat:tool:{n}"), head.response.rect.center());
+        if output.is_some() && click.clicked() {
+            state_.toggle(ui);
+        }
+        if output.is_some() {
+            click.on_hover_text(tr("ui.ai_tool_unfold"));
+        }
+        state_.show_body_unindented(ui, |ui| {
+            if let Some(o) = output {
+                ui.separator();
+                egui::ScrollArea::vertical().id_salt(("sc_agent_tool_out", n)).max_height(180.0).show(ui, |ui| {
+                    ui.add(egui::Label::new(RichText::new(o).monospace().size(11.0)).selectable(true).wrap());
+                });
             }
-            if output.is_some() {
-                click.on_hover_text(tr("ui.ai_tool_unfold"));
-            }
-            state_.show_body_unindented(ui, |ui| {
-                if let Some(o) = output {
-                    ui.separator();
-                    egui::ScrollArea::vertical().id_salt(("sc_agent_tool_out", n)).max_height(180.0).show(ui, |ui| {
-                        ui.add(egui::Label::new(RichText::new(o).monospace().size(11.0)).selectable(true).wrap());
-                    });
-                }
-            });
-        },
-    );
+        });
+    });
 }
 
 /// A small status mark drawn as a shape (no glyph a system font might lack): filled when the

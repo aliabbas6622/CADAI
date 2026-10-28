@@ -211,6 +211,7 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
         // Already an installed app: only the browser build offers to install.
         install_app: None,
         agent_http: Some(std::sync::Arc::new(agent_http)),
+        agent_http_stream: Some(std::sync::Arc::new(agent_http_stream)),
         secrets: Some(std::sync::Arc::new(Keychain)),
         show_in_folder: Some(Box::new(|path| {
             let folder = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -272,37 +273,68 @@ fn http_download(url: &str, to: &std::path::Path, progress: &dyn Fn(u64, Option<
 /// URL the user configured, which may be plain HTTP on this computer (Ollama, LM Studio). No
 /// redirects (a key must not follow one elsewhere), at most 16 MB back.
 fn agent_http(r: &solidcraft_ui_egui::agent_chat::backend::HttpRequest) -> Result<(u16, Vec<u8>), String> {
+    let mut response = agent_http_response(r)?;
+    let status = response.status().as_u16();
+    let body = response.body_mut().with_config().limit(16 << 20).read_to_vec().map_err(|e| e.to_string())?;
+    Ok((status, body))
+}
+
+fn agent_http_stream(
+    r: &solidcraft_ui_egui::agent_chat::backend::HttpRequest,
+    chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(u16, Vec<u8>), String> {
+    use std::io::Read;
+    let mut response = agent_http_response(r)?;
+    let status = response.status().as_u16();
+    let events = response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/event-stream"));
+    if status != 200 || !events {
+        return response.body_mut().with_config().limit(16 << 20).read_to_vec().map(|bytes| (status, bytes)).map_err(|e| e.to_string());
+    }
+    let mut reader = response.body_mut().with_config().limit(16 << 20).reader();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        chunk(buffer.get(..n).ok_or_else(|| "invalid response chunk".to_string())?)?;
+    }
+    Ok((status, Vec::new()))
+}
+
+fn agent_http_response(r: &solidcraft_ui_egui::agent_chat::backend::HttpRequest) -> Result<ureq::http::Response<ureq::Body>, String> {
     use std::time::Duration;
-    let tls = ureq::tls::TlsConfig::builder()
-        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-        .unversioned_rustls_crypto_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
-        .build();
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .tls_config(tls)
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(r.timeout_s.clamp(1, 900))))
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .user_agent("SolidCraft")
-        .max_redirects(0)
-        .build()
-        .into();
-    let mut response = if r.method == "POST" {
-        let mut req = agent.post(&r.url);
+    // Clones of one Agent share its connection pool, including across tool rounds.
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    let agent = AGENT.get_or_init(|| {
+        let tls = ureq::tls::TlsConfig::builder()
+            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+            .unversioned_rustls_crypto_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+            .build();
+        ureq::Agent::config_builder()
+            .tls_config(tls)
+            .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .user_agent("SolidCraft")
+            .max_redirects(0)
+            .build()
+            .into()
+    });
+    let timeout = Some(Duration::from_secs(r.timeout_s.clamp(1, 900)));
+    if r.method == "POST" {
+        let mut req = agent.post(&r.url).config().timeout_global(timeout).build();
         for (k, v) in &r.headers {
             req = req.header(k, v);
         }
         req.send(r.body.as_deref().unwrap_or_default())
     } else {
-        let mut req = agent.get(&r.url);
+        let mut req = agent.get(&r.url).config().timeout_global(timeout).build();
         for (k, v) in &r.headers {
             req = req.header(k, v);
         }
         req.call()
     }
-    .map_err(|e| e.to_string())?;
-    let status = response.status().as_u16();
-    let body = response.body_mut().with_config().limit(16 << 20).read_to_vec().map_err(|e| e.to_string())?;
-    Ok((status, body))
+    .map_err(|e| e.to_string())
 }
 
 /// API keys in the system keychain (service "SolidCraft agent chat", one entry per agent).
@@ -807,6 +839,60 @@ mod icon_tests {
         assert_eq!((icon.width, icon.height), (64, 64));
         assert_eq!(icon.rgba, super::app_icon::rgba(64).expect("original mark"));
         assert_eq!(viewport.app_id.as_deref(), Some(super::APP_ID));
+    }
+}
+
+#[cfg(test)]
+mod agent_http_tests {
+    #[test]
+    fn event_stream_chunks_arrive_before_the_server_finishes() {
+        use std::io::{BufRead, Write};
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let first = "data: first\n\n";
+            let last = "data: [DONE]\n\n";
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first}",
+                first.len() + last.len()
+            )
+            .unwrap();
+            socket.flush().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            socket.write_all(last.as_bytes()).unwrap();
+        });
+        let (seen_tx, seen_rx) = channel();
+        let client = std::thread::spawn(move || {
+            let request = solidcraft_ui_egui::agent_chat::backend::HttpRequest {
+                method: "GET",
+                url: format!("http://{address}"),
+                headers: Vec::new(),
+                body: None,
+                timeout_s: 10,
+            };
+            super::agent_http_stream(&request, &mut |chunk| seen_tx.send(chunk.to_vec()).map_err(|e| e.to_string())).unwrap()
+        });
+        let first = seen_rx.recv_timeout(Duration::from_secs(3));
+        release_tx.send(()).unwrap();
+        let (status, body) = client.join().unwrap();
+        server.join().unwrap();
+        assert!(first.unwrap().starts_with(b"data: first"));
+        assert_eq!(status, 200);
+        assert!(body.is_empty());
     }
 }
 

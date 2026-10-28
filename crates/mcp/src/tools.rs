@@ -16,6 +16,30 @@ const MAX_IMAGE_BYTES: usize = 32 << 20;
 
 const VIEWS: &[&str] = &["iso", "home", "front", "back", "top", "bottom", "left", "right", "fit"];
 
+/// The names this server's tools are called by, so a model that passes one to `execute` is told
+/// what it did instead of receiving a bare "unknown command".
+const TOOL_NAMES: &[&str] = &[
+    "guide",
+    "calculate",
+    "list_commands",
+    "execute",
+    "batch",
+    "inspect_design",
+    "measure",
+    "body_topology",
+    "set_parameter",
+    "screenshot",
+    "export",
+    "crash_reports",
+    "undo",
+    "redo",
+    "new_design",
+    "open",
+    "save",
+];
+/// Most parameter docs one error message repeats.
+const MAX_ERROR_DOCS: usize = 1_500;
+
 fn obj(props: Value, required: &[&str]) -> Value {
     let mut o = json!({"type": "object", "properties": props, "additionalProperties": false});
     if !required.is_empty() {
@@ -58,9 +82,178 @@ fn string(desc: &str) -> Value {
     json!({"type": "string", "description": desc})
 }
 
+/// MCP can describe a few high-frequency command shapes precisely. Engine commands still
+/// accept `Value` and some support richer forms, so this deliberately covers only the shapes
+/// for which the catalog docs and current handler agree.
+fn command_input_schema(id: &str) -> Option<(Value, &'static str)> {
+    let point2 = json!({"type":"array", "items":{"type":"number"}, "minItems":2, "maxItems":2});
+    let point3 = json!({"type":"array", "items":{"anyOf":[{"type":"number"},{"type":"string"}]}, "minItems":3, "maxItems":3});
+    let point2_object = json!({"type":"object", "properties":{"x":{"type":"number"},"y":{"type":"number"}}, "required":["x","y"]});
+    let point3_object = json!({"type":"object", "properties":{"x":{"anyOf":[{"type":"number"},{"type":"string"}]},"y":{"anyOf":[{"type":"number"},{"type":"string"}]},"z":{"anyOf":[{"type":"number"},{"type":"string"}]}}, "required":["x","y","z"]});
+    let point2_expr = json!({"type":"array", "items":{"anyOf":[{"type":"number"},{"type":"string"}]}, "minItems":2, "maxItems":2});
+    let point2_any = json!({"description":"Point as [x, y] (preferred) or {x, y}", "anyOf":[point2,point2_object]});
+    let point3_any = json!({"description":"Point as [x, y, z] (preferred) or {x, y, z}", "anyOf":[point3,point3_object]});
+    let point_ref = json!({"type":"object", "properties":{"at":{"anyOf":[point2_expr,point2_object]},"ref":{"type":"string"}}, "anyOf":[{"required":["at"]},{"required":["ref"]}]});
+    let expr = json!({"anyOf":[{"type":"number"},{"type":"string"}]});
+    let schema = match id {
+        "sketch.rectangle.two_point" => {
+            json!({"type":"object", "properties":{"p0":point2_any,"p1":point2_any,"construction":{"type":"boolean"}}, "required":["p0","p1"], "additionalProperties":true})
+        }
+        "sketch.circle.center" => {
+            json!({"type":"object", "properties":{"center":{"description":"Point as [x, y] (preferred), a point id, or {at, ref}","anyOf":[{"type":"array","items":{"anyOf":[{"type":"number"},{"type":"string"}]},"minItems":2,"maxItems":2},point2_object,{"type":"string"},point_ref]},"radius":{"type":["number","string"]},"diameter":{"type":["number","string"]}}, "required":["center"], "anyOf":[{"required":["radius"]},{"required":["diameter"]}], "additionalProperties":true})
+        }
+        "sketch.line" => {
+            json!({"type":"object", "properties":{"points":{"type":"array", "minItems":2, "items":{"anyOf":[{"type":"array","items":{"anyOf":[{"type":"number"},{"type":"string"}]},"minItems":2,"maxItems":2},point2_object,{"type":"string"},point_ref]}}, "closed":{"type":"boolean"}, "construction":{"type":"boolean"}}, "required":["points"], "additionalProperties":true})
+        }
+        "solid.box" => {
+            json!({"type":"object", "properties":{"length":expr,"width":expr,"height":expr,"corner":point3_any,"center":point3_any}, "required":["length","width","height"], "additionalProperties":true})
+        }
+        "solid.cylinder" => {
+            json!({"type":"object", "properties":{"radius":expr,"diameter":expr,"height":expr,"base":point3_any}, "required":["height"], "anyOf":[{"required":["radius"]},{"required":["diameter"]}], "additionalProperties":true})
+        }
+        _ => return None,
+    };
+    let class = match id {
+        "sketch.rectangle.two_point" | "sketch.circle.center" | "solid.box" | "solid.cylinder" => "point",
+        "sketch.line" => "list",
+        _ => "radius-diameter",
+    };
+    Some((schema, class))
+}
+
+fn command_shape_classes(id: &str) -> Value {
+    match id {
+        "sketch.rectangle.two_point" => json!({"p0":"point", "p1":"point"}),
+        "sketch.circle.center" => json!({"center":"point", "radius":"radius-diameter", "diameter":"radius-diameter"}),
+        "sketch.line" => json!({"points":"list"}),
+        "solid.box" => json!({"corner":"point", "center":"point"}),
+        "solid.cylinder" => json!({"base":"point", "radius":"radius-diameter", "diameter":"radius-diameter"}),
+        _ => Value::Null,
+    }
+}
+
+fn valid_point(v: &Value, n: usize, expressions: bool) -> bool {
+    v.as_array().is_some_and(|a| a.len() == n && a.iter().all(|x| x.is_number() || (expressions && x.as_str().is_some())))
+}
+
+/// Return a field-specific shape error for the supported command schemas.
+fn validate_command_params(id: &str, p: &Value) -> Result<(), String> {
+    let Some((_, _)) = command_input_schema(id) else { return Ok(()) };
+    let Some(o) = p.as_object() else { return Err(format!("`params` for `{id}` must be an object")) };
+    let point = |key: &str, n: usize, expressions: bool| -> Result<(), String> {
+        let object_point = o.get(key).and_then(Value::as_object).is_some_and(|v| {
+            let keys = if n == 2 { &["x", "y"][..] } else { &["x", "y", "z"][..] };
+            keys.iter().all(|k| v.get(*k).is_some_and(|x| x.is_number() || (expressions && x.as_str().is_some())))
+        });
+        if o.get(key).is_some_and(|v| !valid_point(v, n, expressions) && !object_point) {
+            let expected =
+                if n == 2 { "a 2D point `[x, y]` (e.g. `[0, 0]`) or `{x, y}`" } else { "a 3D point `[x, y, z]` (e.g. `[0, 0, 0]`) or `{x, y, z}`" };
+            Err(format!("`{key}` must be {expected}; coordinates must be {}", if expressions { "numbers or length expressions" } else { "numbers" }))
+        } else {
+            Ok(())
+        }
+    };
+    match id {
+        "sketch.rectangle.two_point" => {
+            for key in ["p0", "p1"] {
+                if !o.contains_key(key) {
+                    return Err(format!("`{key}` is required"));
+                }
+                point(key, 2, false)?;
+            }
+        }
+        "sketch.circle.center" => {
+            let center = o.get("center").ok_or("`center` is required")?;
+            let center_ok = valid_point(center, 2, true)
+                || center.is_string()
+                || center.as_object().is_some_and(|v| {
+                    (v.get("x").is_some_and(Value::is_number) && v.get("y").is_some_and(Value::is_number))
+                        || v.get("ref").and_then(Value::as_str).is_some()
+                        || v.get("at").is_some_and(|at| valid_point(at, 2, false))
+                });
+            if !center_ok {
+                return Err("`center` must be a point array, point id, or {at, ref}".into());
+            }
+            let expression = |key| o.get(key).is_some_and(|v| v.is_number() || v.as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 4096));
+            let radius = expression("radius");
+            let diameter = expression("diameter");
+            if !radius && !diameter {
+                return Err("provide a `radius` or `diameter` as a number or length expression".into());
+            }
+        }
+        "sketch.line" => {
+            let Some(points) = o.get("points").and_then(Value::as_array) else { return Err("`points` must be a list of point arrays".into()) };
+            let point_object = |v: &Value| {
+                v.as_object().is_some_and(|p| {
+                    (p.get("x").is_some_and(Value::is_number) && p.get("y").is_some_and(Value::is_number))
+                        || p.get("ref").and_then(Value::as_str).is_some()
+                        || p.get("at").is_some_and(|at| {
+                            valid_point(at, 2, true)
+                                || at
+                                    .as_object()
+                                    .is_some_and(|a| a.get("x").is_some_and(Value::is_number) && a.get("y").is_some_and(Value::is_number))
+                        })
+                })
+            };
+            if points.len() < 2 || points.iter().any(|v| !(valid_point(v, 2, true) || v.is_string() || point_object(v))) {
+                return Err("`points` must contain at least two [x, y] point arrays (or point references)".into());
+            }
+        }
+        "solid.box" => {
+            for key in ["length", "width", "height"] {
+                if !o.get(key).is_some_and(|v| v.is_number() || v.is_string()) {
+                    return Err(format!("`{key}` must be a number or length expression"));
+                }
+            }
+            for key in ["corner", "center"] {
+                point(key, 3, true)?;
+            }
+        }
+        "solid.cylinder" => {
+            if !o.get("height").is_some_and(|v| v.is_number() || v.is_string()) {
+                return Err("`height` must be a number or length expression".into());
+            }
+            let radius = o.get("radius").is_some_and(|v| v.is_number() || v.is_string());
+            let diameter = o.get("diameter").is_some_and(|v| v.is_number() || v.is_string());
+            if !radius && !diameter {
+                return Err("provide a `radius` or `diameter`".into());
+            }
+            point("base", 3, true)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Every tool, with its JSON schema. The same list serves the headless and the bridged backend.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
+        tool(
+            "guide",
+            "Modeling guide",
+            "Short SolidCraft workflows for building, editing and checking a design. Read the relevant topic before a multi-step task; the guide uses the same commands available through these tools.",
+            obj(
+                json!({"topic": {"type": "string", "enum": ["overview", "model", "edit", "verify"], "description": "Workflow to read (default overview)"}}),
+                &[],
+            ),
+            Effect::ReadOnly,
+        ),
+        tool(
+            "calculate",
+            "Calculate dimensions",
+            "Evaluate up to 20 expressions in one call without changing the design. Each entry is a string or {name, expression}; later entries can use earlier named results with their units preserved. Names exist only within this call, not as design parameters. Supports arithmetic, powers, pi, sqrt, sin, cos, hypot and units (mm, cm, m, in, ft, deg, rad). Results use mm and radians. Supply literals or already observed design values; no design lookup. Prefer expressions directly in command fields that support them; use this tool for derived coordinates or independent checks. Example: {\"expressions\":[{\"name\":\"span\",\"expression\":\"2 ft\"},{\"name\":\"half\",\"expression\":\"span / 2\"},\"half * span\"]}.",
+            obj(
+                json!({"expressions": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"anyOf": [
+                    {"type": "string", "minLength": 1, "maxLength": 4096},
+                    {"type": "object", "properties": {
+                        "name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$", "description": "Unique name, excluding units, constants and functions"},
+                        "expression": {"type": "string", "minLength": 1, "maxLength": 4096}
+                    }, "required": ["name", "expression"], "additionalProperties": false}
+                ]}, "description": "Evaluated in order; named results are available to later expressions"}}),
+                &["expressions"],
+            ),
+            Effect::ReadOnly,
+        ),
         tool(
             "list_commands",
             "List commands",
@@ -79,7 +272,10 @@ pub fn tool_definitions() -> Vec<Value> {
              Examples: sketch.create {plane: \"XY\"}; sketch.rectangle.two_point {p0: [0,0], p1: [40,30]}; sketch.circle.center \
              {center: [20,15], radius: 5}; sketch.dimension {entities: [curve id], value: \"width\"}; sketch.finish {}; solid.extrude \
              {distance: 20, operation: \"cut\"}; solid.fillet {edges: [[0,0,10]], radius: 3}; solid.box {length, \
-             width, height}. Lengths are mm; expressions may use parameters and units (\"width / 2\", \"30 deg\"). Returns \
+             width, height}; solid.cylinder {radius: 10, height: 20, base: [100,0,0], operation: \"new\"}. \
+             Cylinder base is the bottom centre, its default axis is Z. Use parameters already documented here \
+             directly; use list_commands with the exact dotted command id for unfamiliar commands. \
+             Lengths are mm; expressions may use parameters and units (\"width / 2\", \"30 deg\"). Returns \
              the command's result; failures leave the design unchanged. Sketch commands that add geometry return \
              created: {points, curves, constraints, dimensions}: the ids of what they added, stable and not reused \
              after a delete (undo rewinds the counters with the design), usable right away \
@@ -110,6 +306,7 @@ pub fn tool_definitions() -> Vec<Value> {
                         "items": {"type": "object", "properties": {"command": {"type": "string"}, "params": {"type": "object"}}, "required": ["command"]},
                     },
                     "rollback": {"type": "boolean", "description": "Undo completed steps when one fails (default true)"},
+                    "progressive": {"type": "boolean", "description": "Show each completed command in the app viewport before running the next; rollback is preserved (default false)"},
                     "timings": {"type": "boolean", "description": "Add `timings`: [{index, command, ms}] for every step run (the failing one included) and `total_ms` (default false)"},
                     "profile": {"type": "boolean", "description": "Like timings, and each step's `profile`: {boolean_ms, tessellate_ms, other_ms}, its time in kernel booleans, in tessellation and the rest (default false)"},
                     "verbose": {"type": "boolean", "description": "false: a compact reply. Feature steps leave out the full body list (created_bodies, changed_bodies and removed_bodies stay), sketch steps the ids they repeat outside `created` (default true)"},
@@ -165,7 +362,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "Set a parameter",
             "Create or change a user parameter and re-evaluate the timeline. `value` is a number (mm) or an expression \
              (\"40 mm\", \"width * 2\", \"30 deg\"); `expression` is the same thing under the name the parameters.change command \
-             uses. Give one of the two (both only when they agree). Returns the new value, the features recomputed (`recomputed`), the \
+             uses. Create a named parameter successfully before an expression refers to it. Give one of the two (both only when they agree). Returns the new value, the features recomputed (`recomputed`), the \
              features whose earlier result for the same inputs was reused instead (`restored`, e.g. after setting a value back) and any \
              features that now fail.",
             obj(
@@ -369,6 +566,88 @@ fn exec(b: &mut dyn Backend, command: &str, params: Value) -> Result<Value, Stri
     b.call("engine.execute", json!({"command": command, "params": params}))
 }
 
+/// Batch steps as engine.batch takes them: every step's own keys beside `command` are its
+/// parameters, and `params` may be an object or JSON text for one.
+fn steps_of(steps: &[Value]) -> Result<Vec<Value>, String> {
+    let mut out = Vec::with_capacity(steps.len());
+    for (i, step) in steps.iter().enumerate() {
+        let Some(o) = step.as_object() else {
+            return Err(format!("step {i} must be an object {{\"command\": \"…\", \"params\": {{…}}}}"));
+        };
+        let Some(id) = o.get("command").or_else(|| o.get("id")).and_then(Value::as_str) else {
+            return Err(format!("step {i} has no `command`"));
+        };
+        let params = params_of(o, &["command", "id"]).map_err(|e| format!("step {i} ({id}): {e}"))?;
+        out.push(json!({"command": id, "params": params}));
+    }
+    Ok(out)
+}
+
+/// The parameters of an `execute` call: `params` (an object, or JSON text for one) and every
+/// other key beside `command`, which callers routinely pass at the top level. Dropping those
+/// silently turns a misplaced `features` into a misleading "`features` must list features".
+fn params_of(obj: &Map<String, Value>, reserved: &[&str]) -> Result<Value, String> {
+    let mut out = Map::new();
+    match obj.get("params") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(o)) => out.extend(o.clone()),
+        Some(Value::String(s)) if s.trim().is_empty() => {}
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
+            Ok(Value::Object(o)) => out.extend(o),
+            _ => return Err("`params` must be a JSON object, e.g. {\"distance\": 20}".into()),
+        },
+        Some(_) => return Err("`params` must be a JSON object, e.g. {\"distance\": 20}".into()),
+    }
+    for (k, v) in obj {
+        if k == "params" || reserved.contains(&k.as_str()) || v.is_null() {
+            continue;
+        }
+        out.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    Ok(Value::Object(out))
+}
+
+/// A failed command with what the caller needs to correct it: the command's own parameter docs
+/// when it exists, or the distinction between a tool and a command when it does not. Models
+/// recover from a call in one retry when the error names the expected shape; a bare 'must list
+/// features' costs another model round trip.
+fn explain(b: &mut dyn Backend, command: &str, error: String) -> String {
+    if TOOL_NAMES.contains(&command) {
+        return format!("{error}\n`{command}` is a tool, not an engine command: call it directly instead of through `execute`.");
+    }
+    let parameter_hint = unknown_parameter_hint(&error);
+    if let Some(params) = command_params(b, command) {
+        return format!(
+            "{error}\nExpected parameters for `{command}`: {params}\nCorrect the arguments and send the call again; do not repeat the same arguments.{}",
+            parameter_hint.map_or_else(String::new, |hint| format!("\n{hint}"))
+        );
+    }
+    if error.contains("unknown command") {
+        return format!("{error}\nFind the exact dotted id with list_commands {{\"filter\":\"<area or name>\"}}, then call it.");
+    }
+    parameter_hint.map_or(error.clone(), |hint| format!("{error}\n{hint}"))
+}
+
+fn unknown_parameter_hint(error: &str) -> Option<String> {
+    let tail = error.split_once("unknown parameter `")?.1;
+    let name = tail.split('`').next()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The expression refers to missing parameter `{name}`. Use a literal value, or create it with `set_parameter` (`name`: `{name}` and `value` or `expression`) and wait for that call to succeed before referencing it. With batch rollback enabled, a later failure undoes parameters created earlier in the batch; create the parameter in a separate successful call first."
+    ))
+}
+
+/// The parameter docs `engine.commands` holds for exactly `id`.
+fn command_params(b: &mut dyn Backend, id: &str) -> Option<String> {
+    let rows = b.call("engine.commands", json!({"filter": id})).ok()?;
+    let rows = rows.as_array()?;
+    let row = rows.iter().find(|c| c.get("id").and_then(Value::as_str) == Some(id))?;
+    let params = row.get("params").and_then(Value::as_str).unwrap_or("").trim();
+    (!params.is_empty()).then(|| params.chars().take(MAX_ERROR_DOCS).collect())
+}
+
 fn pick(a: &Map<String, Value>, keys: &[&str]) -> Value {
     Value::Object(keys.iter().filter_map(|k| a.get(*k).filter(|v| !v.is_null()).map(|v| (k.to_string(), v.clone()))).collect())
 }
@@ -379,18 +658,45 @@ fn str_arg<'a>(a: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
 
 fn dispatch(b: &mut dyn Backend, name: &str, a: &Map<String, Value>) -> Result<Value, String> {
     match name {
+        "guide" => Ok(guide(str_arg(a, "topic").unwrap_or("overview"))),
+        "calculate" => calculate(a),
         "list_commands" => {
             let all = b.call("engine.commands", json!({}))?;
-            let Some(f) = str_arg(a, "filter").map(str::to_lowercase).filter(|f| !f.is_empty()) else { return Ok(all) };
+            let enrich = |rows: &Value| {
+                Value::Array(
+                    rows.as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .map(|row| {
+                                    let id = row.get("id").and_then(Value::as_str);
+                                    let mut row = row.clone();
+                                    if let Some(id) = id
+                                        && let Some((schema, class)) = command_input_schema(id)
+                                    {
+                                        row["inputSchema"] = schema;
+                                        row["shapeClass"] = json!(class);
+                                        row["shapeClasses"] = command_shape_classes(id);
+                                    }
+                                    row
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                )
+            };
+            let Some(f) = str_arg(a, "filter").map(str::to_lowercase).filter(|f| !f.is_empty()) else { return Ok(enrich(&all)) };
             let hit = |c: &Value| {
                 // Not "params": many docs name other commands (e.g. "usable in sketch.delete"), #269.
                 ["id", "label", "panel", "tab"].iter().any(|k| c.get(*k).and_then(Value::as_str).is_some_and(|s| s.to_lowercase().contains(&f)))
             };
-            Ok(Value::Array(all.as_array().map(|v| v.iter().filter(|c| hit(c)).cloned().collect()).unwrap_or_default()))
+            Ok(enrich(&Value::Array(all.as_array().map(|v| v.iter().filter(|c| hit(c)).cloned().collect()).unwrap_or_default())))
         }
         "execute" => {
             let id = str_arg(a, "command").ok_or("`command` is required")?;
-            let v = exec(b, id, a.get("params").cloned().filter(Value::is_object).unwrap_or(json!({})))?;
+            let params = params_of(a, &["command", "verbose"])?;
+            validate_command_params(id, &params)?;
+            let v = exec(b, id, params).map_err(|e| explain(b, id, e))?;
             Ok(if a.get("verbose").and_then(Value::as_bool).unwrap_or(true) { v } else { compact(v) })
         }
         "inspect_design" => {
@@ -439,6 +745,78 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Map<String, Value>) -> Result<V
         "save" => exec(b, "file.save", pick(a, &["path", "format"])),
         other => Err(format!("unknown tool `{other}`")),
     }
+}
+
+fn calculate(a: &Map<String, Value>) -> Result<Value, String> {
+    use solidcraft_engine::doc::{DocError, expr};
+
+    let expressions = a.get("expressions").and_then(Value::as_array).ok_or("`expressions` must be an array of strings")?;
+    if expressions.is_empty() || expressions.len() > 20 {
+        return Err("`expressions` needs 1 to 20 entries".into());
+    }
+    let mut results = Vec::with_capacity(expressions.len());
+    let mut locals = std::collections::BTreeMap::new();
+    for (index, item) in expressions.iter().enumerate() {
+        let name = if let Some(fields) = item.as_object() {
+            if fields.keys().any(|key| key != "name" && key != "expression") {
+                return Err(format!("expression {index}: only `name` and `expression` fields are accepted; put units inside the expression"));
+            }
+            let name = item.get("name").and_then(Value::as_str).ok_or_else(|| format!("expression {index}: `name` is required"))?;
+            if name.is_empty()
+                || name.len() > 64
+                || !name.bytes().enumerate().all(|(i, b)| b.is_ascii_alphabetic() || b == b'_' || (i > 0 && b.is_ascii_digit()))
+                || expr::is_reserved(name)
+                || locals.contains_key(name)
+            {
+                return Err(format!("expression {index}: `name` must be a unique non-reserved identifier of at most 64 ASCII characters"));
+            }
+            Some(name)
+        } else {
+            None
+        };
+        let expression = item
+            .get("expression")
+            .unwrap_or(item)
+            .as_str()
+            .filter(|s| !s.trim().is_empty() && s.len() <= 4096)
+            .ok_or_else(|| format!("expression {index} must be a nonempty string of at most 4096 characters"))?;
+        let value = expr::eval_with(expression, &|name| {
+            locals.get(name).copied().ok_or_else(|| DocError::Expr(format!("unknown variable `{name}`; supply a literal or an earlier named result")))
+        })
+        .map_err(|e| format!("expression {index}: {e}"))?;
+        let power = |unit: &str, n: i8| match n {
+            0 => None,
+            1 => Some(unit.to_string()),
+            _ => Some(format!("{unit}^{n}")),
+        };
+        let units: Vec<String> = [power("mm", value.len), power("rad", value.ang)].into_iter().flatten().collect();
+        let mut result =
+            json!({"expression": expression, "value": value.v, "unit": if units.is_empty() { "1".to_string() } else { units.join("*") }});
+        if let Some(name) = name {
+            locals.insert(name.to_string(), value);
+            result["name"] = json!(name);
+        }
+        results.push(result);
+    }
+    Ok(json!({"results": results}))
+}
+
+fn guide(topic: &str) -> Value {
+    let text = match topic {
+        "model" => {
+            "Use a fresh host snapshot or inspect_design {measure:false,sketches:false}; never assume the design is empty. Work out dimensions, placement, expected body count, volume and bounding box before building. Use expressions directly in supported command fields; group derived numeric coordinates and independent checks in one calculate call. Find unfamiliar parameter shapes with filtered list_commands. Build in a few coherent batch calls with rollback and verbose:false. Put uncertain booleans in their own batch. Compare fresh host verification or measure to your expected values; inspect timeline errors and warnings before continuing."
+        }
+        "edit" => {
+            "Preserve the existing design and its timeline. First call inspect_design {measure:false,sketches:false} and measure {} for a baseline. Use execute {command:\"parameters.list\",params:{filter:\"feature\"}} to find driving inputs. Change parameters or edit the relevant feature instead of rebuilding the part. Compare body count, volume, bounding box and timeline errors against the baseline and the user's requested change. Do not open or replace a design without the user's approval."
+        }
+        "verify" => {
+            "A successful command reply does not prove the geometry is right. Compare measure {} to independently computed body count, volume, bounding box and centre of mass. A cut or hole with unchanged volume may have missed; a join may have merged bodies unexpectedly. Check inspect_design {measure:false,sketches:false} for failed or warned features. For visible details use screenshot {source:\"model\",width:480,height:320}; inspect exact edges or faces with body_topology only when needed. Report which checks passed and which remain uncertain."
+        }
+        _ => {
+            "Choose guide {topic:\"model\"} for a new part, {topic:\"edit\"} for an existing design, or {topic:\"verify\"} to check a result. Start by inspecting the open design. Plan dimensions and expected measurements, make a bounded change through SolidCraft tools, then verify the actual geometry before reporting success. Use verbose:false for large execute and batch replies."
+        }
+    };
+    json!({"topic": topic, "guide": text})
 }
 
 /// `set_parameter`'s new value: `value` or `expression` (the parameters.change name), one of
@@ -517,7 +895,19 @@ fn batch(b: &mut dyn Backend, a: &Map<String, Value>) -> Value {
     if steps.len() > MAX_BATCH {
         return text_result(&json!(format!("batch too long ({} steps, at most {MAX_BATCH})", steps.len())), true);
     }
+    let steps = match steps_of(steps) {
+        Ok(steps) => steps,
+        Err(e) => return text_result(&Value::String(e), true),
+    };
+    for (i, step) in steps.iter().enumerate() {
+        if let (Some(id), Some(params)) = (step.get("command").and_then(Value::as_str), step.get("params"))
+            && let Err(e) = validate_command_params(id, params)
+        {
+            return text_result(&Value::String(format!("step {i} ({id}): {e}")), true);
+        }
+    }
     let rollback = a.get("rollback").and_then(Value::as_bool).unwrap_or(true);
+    let progressive = a.get("progressive").and_then(Value::as_bool).unwrap_or(false);
     let verbose = a.get("verbose").and_then(Value::as_bool).unwrap_or(true);
     let profile = a.get("profile").and_then(Value::as_bool).unwrap_or(false);
     let timed = profile || a.get("timings").and_then(Value::as_bool).unwrap_or(false);
@@ -529,9 +919,9 @@ fn batch(b: &mut dyn Backend, a: &Map<String, Value>) -> Value {
         o.insert("timings".into(), Value::Bool(true));
         o.insert("profile".into(), Value::Bool(profile));
     }
-    if params.to_string().len() + 64 * 1024 <= solidcraft_engine::MAX_LINE {
+    if !progressive && params.to_string().len() + 64 * 1024 <= solidcraft_engine::MAX_LINE {
         match b.call("engine.batch", params) {
-            Ok(r) => return batch_reply(&r, rollback, verbose),
+            Ok(r) => return batch_reply(b, &r, rollback, verbose),
             // Older apps and the headless session, or the app wants the steps one by one.
             Err(e) if e.starts_with("unknown method") || e.starts_with("engine.batch unavailable") => {}
             // Never sent: no app to send it to.
@@ -550,9 +940,15 @@ fn batch(b: &mut dyn Backend, a: &Map<String, Value>) -> Value {
     // The kernel's share can only be measured where the commands run: in this process.
     let profile = profile && b.in_process();
     for (i, step) in steps.iter().enumerate() {
-        let command = step.get("command").or_else(|| step.get("id")).and_then(Value::as_str);
+        let command = step.get("command").and_then(Value::as_str);
         let (r, took) = timing::time(profile, || match command {
-            Some(id) => exec(b, id, step.get("params").cloned().filter(|p| !p.is_null()).unwrap_or(json!({}))),
+            Some(id) => {
+                let mut request = json!({"command": id, "params": step.get("params").cloned().unwrap_or(json!({}))});
+                if progressive {
+                    request["present"] = json!(true);
+                }
+                b.call("engine.execute", request).map_err(|e| explain(b, id, e))
+            }
             None => Err("missing `command`".to_string()),
         });
         if timed {
@@ -589,22 +985,30 @@ fn with_timings(mut reply: Value, timed: bool, rows: Vec<Value>, total_ms: f64) 
 }
 
 /// The `batch` reply from the app's `engine.batch` answer, shaped as the per-step path shapes it.
-fn batch_reply(r: &Value, rollback: bool, verbose: bool) -> Value {
+fn batch_reply(b: &mut dyn Backend, r: &Value, rollback: bool, verbose: bool) -> Value {
     let results: Vec<Value> =
         r["results"].as_array().cloned().unwrap_or_default().into_iter().map(|v| if verbose { v } else { compact(v) }).collect();
     let (mut reply, error) = match r.get("failed").filter(|f| !f.is_null()) {
         None => (json!({"ok": true, "completed": results.len(), "results": results}), false),
-        Some(failed) => (
-            json!({
-                "ok": false,
-                "completed": r["completed"],
-                "failed": failed,
-                "rolled_back": rollback,
-                "undone": r["undone"],
-                "results": results,
-            }),
-            true,
-        ),
+        Some(failed) => {
+            let mut failed = failed.clone();
+            let command = failed.get("command").and_then(Value::as_str).map(str::to_string);
+            let message = failed.get("error").and_then(Value::as_str).map(str::to_string);
+            if let (Some(command), Some(message), Some(o)) = (command, message, failed.as_object_mut()) {
+                o.insert("error".into(), json!(explain(b, &command, message)));
+            }
+            (
+                json!({
+                    "ok": false,
+                    "completed": r["completed"],
+                    "failed": failed,
+                    "rolled_back": rollback,
+                    "undone": r["undone"],
+                    "results": results,
+                }),
+                true,
+            )
+        }
     };
     // The app timed the steps where they ran.
     if let Some(o) = reply.as_object_mut() {

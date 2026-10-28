@@ -21,9 +21,14 @@ pub mod acp;
 mod acp_client;
 pub mod agents;
 #[cfg(not(target_arch = "wasm32"))]
+mod api_cache;
+#[cfg(not(target_arch = "wasm32"))]
 mod api_client;
+#[cfg(not(target_arch = "wasm32"))]
+mod api_stream;
 pub mod attach;
 pub mod backend;
+mod creativity;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod discover;
 pub mod gate;
@@ -238,6 +243,7 @@ pub enum Item {
 
 /// The message being answered: what undo and the limits need.
 struct Turn {
+    started: f64,
     /// The design and the undo depth before it.
     start_doc: Arc<solidcraft_engine::doc::Document>,
     start_undo: usize,
@@ -574,13 +580,19 @@ impl AgentChat {
                 self.mode = current;
             }
             Event::Models { current, available } => {
+                let selection_update = available.is_empty();
                 if !available.is_empty() {
                     if !self.running_endpoint.is_empty() {
                         self.models_cache.insert(self.running_endpoint.clone(), available.clone());
                     }
                     self.models = available;
                 }
-                self.model = current;
+                // A model-list response can arrive after the user changed the picker. Keep
+                // that newer choice; use the backend's configured model only to initialize an
+                // empty picker or when it still matches the current selection.
+                if selection_update || self.model.is_empty() || self.model == current {
+                    self.model = current;
+                }
             }
             Event::AuthRequired { methods } => {
                 self.auth = methods;
@@ -721,7 +733,14 @@ pub fn connect(app: &mut SolveApp, ctx: &egui::Context) {
         agents::Kind::Acp => acp_client::AcpBackend::start(&entry.argv, start).map(|b| Box::new(b) as Box<dyn ChatBackend>),
         agents::Kind::Api => match http {
             Some(http) => api_client::ApiBackend::start(
-                api_client::ApiConfig { name: entry.name.clone(), base_url: entry.base_url.clone(), model: entry.model.clone(), key, http },
+                api_client::ApiConfig {
+                    name: entry.name.clone(),
+                    base_url: entry.base_url.clone(),
+                    model: entry.model.clone(),
+                    key,
+                    http,
+                    stream: app.services.agent_http_stream.clone(),
+                },
                 start,
             )
             .map(|b| Box::new(b) as Box<dyn ChatBackend>),
@@ -983,11 +1002,21 @@ fn start_turn_with(app: &mut SolveApp, text: String, image: bool, at: Option<usi
         }
     }
     parts.extend(attach::parts(&files, pictures, documents));
+    if let Some(guidance) = creativity::guidance(&text) {
+        parts.push(PromptPart::Text(guidance));
+    }
     // The undo step is named after the message, or its first file when it has no words.
     let first_line = text.lines().find(|l| !l.trim().is_empty()).or_else(|| files.first().map(|f| f.name.as_str())).unwrap_or("");
     let label: String = first_line.chars().take(48).collect();
-    app.agent_chat.turn =
-        Some(Turn { start_doc: app.session.doc.clone(), start_undo: app.session.undo.len(), changes: 0, requests: 0, limit_told: false, label });
+    app.agent_chat.turn = Some(Turn {
+        started: app.now,
+        start_doc: app.session.doc.clone(),
+        start_undo: app.session.undo.len(),
+        changes: 0,
+        requests: 0,
+        limit_told: false,
+        label,
+    });
     app.agent_chat.last = Some((text, image, at, files));
     app.agent_chat.state = Some(State::Busy);
     app.agent_chat.stopped = false;
@@ -1470,6 +1499,9 @@ pub fn control(app: &mut SolveApp, ctx: &egui::Context, p: &Value) -> Result<Val
     if let Some(b) = p.get("toolbar_button").and_then(Value::as_bool) {
         app.preferences.ai_toolbar_button = b;
     }
+    if let Some(b) = p.get("full_mode").and_then(Value::as_bool) {
+        app.preferences.ai_full_mode = b;
+    }
     if let Some(m) = p.get("permissions") {
         let Some(mode) = m.as_str().and_then(agents::Mode::parse) else { return Err("permissions must be ask, edits or all".into()) };
         app.preferences.ai_permissions = mode;
@@ -1640,6 +1672,7 @@ pub fn status(app: &SolveApp) -> Value {
     json!({
         "features": app.preferences.ai_features,
         "toolbarButton": app.preferences.ai_toolbar_button,
+        "fullMode": app.preferences.ai_full_mode,
         "permissions": app.preferences.ai_permissions.id(),
         "agents": agents::entries(app).iter().map(|e| json!({"id": e.id, "name": e.name, "kind": if e.kind == agents::Kind::Api { "api" } else { "acp" }, "found": e.found, "version": e.version, "login": e.login})).collect::<Vec<_>>(),
         "currentAgent": agents::current(app).map(|e| e.id),

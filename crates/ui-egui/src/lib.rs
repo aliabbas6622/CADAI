@@ -298,6 +298,8 @@ pub struct Services {
     pub install_app: Option<install::InstallApp>,
     /// HTTP for the agent chat's API agents (OpenAI-compatible endpoints); None: no API agents.
     pub agent_http: Option<agent_chat::backend::HttpFn>,
+    /// Streaming HTTP for API chat; a host without it uses buffered responses.
+    pub agent_http_stream: Option<agent_chat::backend::HttpStreamFn>,
     /// The system keychain, for API agents' keys; None: keys can't be stored.
     pub secrets: Option<std::sync::Arc<dyn agent_chat::backend::Secrets>>,
 }
@@ -1536,6 +1538,8 @@ impl SolveApp {
                 continue;
             };
             let reply = req.reply.clone();
+            let present = matches!(req.method.as_str(), "engine.execute" | "command")
+                && req.params.get("present").and_then(serde_json::Value::as_bool) == Some(true);
             if agent_cursor::intercept(self, &req.method, &req.params, &reply) {
                 ctx.request_repaint();
                 continue;
@@ -1557,6 +1561,9 @@ impl SolveApp {
                 }
             }
             ctx.request_repaint();
+            if present {
+                break;
+            }
         }
         self.control_rx = rx;
     }

@@ -114,6 +114,11 @@ pub struct HttpRequest {
 /// Sends an [`HttpRequest`]: the status and the body, or why it failed.
 pub type HttpFn = std::sync::Arc<dyn Fn(&HttpRequest) -> Result<(u16, Vec<u8>), String> + Send + Sync>;
 
+/// Streams successful event-stream bodies through `chunk`. Returning an error from `chunk`
+/// closes the response. Other responses return their bounded body, as [`HttpFn`] does.
+pub type HttpStreamFn =
+    std::sync::Arc<dyn Fn(&HttpRequest, &mut dyn FnMut(&[u8]) -> Result<(), String>) -> Result<(u16, Vec<u8>), String> + Send + Sync>;
+
 /// The system keychain (the desktop host's), for API keys: never in the preferences.
 pub trait Secrets: Send + Sync {
     fn get(&self, id: &str) -> Result<Option<String>, String>;

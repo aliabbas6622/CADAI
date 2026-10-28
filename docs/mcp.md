@@ -15,6 +15,24 @@ agents), see [web-runtime.md](web-runtime.md). For sandboxed plugins and paramet
 features that also use `run(command, args)`, see [plugins.md](plugins.md). Desktop MCP in this
 document remains the reference implementation today.
 
+## Calculating related dimensions
+
+Use expressions directly in command fields that document expression support. For numeric
+coordinates or independent checks, `calculate` evaluates up to 20 entries in order in one call:
+
+```json
+{"expressions":[{"name":"span","expression":"2 ft"},{"name":"half","expression":"span / 2"},"half * span"]}
+```
+
+This returns 609.6 mm, 304.8 mm and 185806.08 mm². Each entry may still be a plain expression
+string. Named results retain their dimensions, are available only to later entries in that
+call, and do not become design parameters. Names must be unique ASCII identifiers of at most
+64 characters and cannot be units, constants or functions. Unknown names, incompatible units
+and nonfinite arithmetic return errors. `calculate` does not read the design or change undo history.
+
+For the research and verification behind agent latency improvements, see
+[agent efficiency](agent-efficiency.md).
+
 ## Start it
 
 ```sh
@@ -99,7 +117,7 @@ file dialogs are never limited.
 ### Tool annotations
 
 Each tool says what it may do, for clients that ask before running tools (or auto-approve on
-these hints). `list_commands`, `inspect_design`, `measure`, `body_topology` and `crash_reports`
+these hints). `guide`, `calculate`, `list_commands`, `inspect_design`, `measure`, `body_topology` and `crash_reports`
 are read-only. `set_parameter`, `undo` and `redo` change the design undoably. `new_design`
 replaces it (destructive). `execute`, `batch`, `open`, `save`, `export` and `screenshot` (whose
 `path` writes a file) can read, write, overwrite or delete files: they are not read-only,
@@ -142,7 +160,9 @@ They cover the workflow, the command shapes, how to verify with `measure`, and t
 
 | Tool | Arguments | What it does |
 |---|---|---|
-| `list_commands` | `filter?` | The command catalog: id, label, tab/panel, shortcut, parameter docs, enabled now. `filter` matches id, label, tab and panel. |
+| `guide` | `topic?` (`overview`, `model`, `edit`, `verify`; default `overview`) | A short workflow the agent can read in any MCP client, including SolidCraft's sidebar. It covers inspecting the open design, preserving an existing timeline, making compact batches and checking the resulting geometry. |
+| `calculate` | `expressions` (1–20 strings) | Fast local arithmetic and unit conversion using SolidCraft's expression evaluator. Returns each value in base units (mm, rad, or their powers); it does not edit the design or look up design parameters. Example: `{"expressions":["2 ft + 300 mm","sqrt(3^2 + 4^2)"]}`. |
+| `list_commands` | `filter?` | The command catalog: id, label, tab/panel, shortcut, parameter docs, enabled now. `filter` matches id, label, tab and panel. Common rectangle, circle, line, box and cylinder commands also include an `inputSchema` for early shape checks. |
 | `execute` | `command`, `params?`, `verbose?` (default true) | Run any command with JSON parameters (`list_commands` shows them). Failures leave the design unchanged. A feature command replies with the feature (`feature`, `name`), every body (`bodies`) and the bodies it created, changed and removed (`created_bodies`, `changed_bodies`, `removed_bodies`). `verbose: false` uses the same compact reply as `batch`. |
 | `batch` | `commands: [{command, params}]`, `rollback?` (default true), `verbose?` (default true), `timings?`, `profile?` (default false) | Run steps in order, stop at the first error and undo the completed steps. The reply names the failing step (`failed.index`, `failed.command`, `failed.error`) and every result before it. `verbose: false` keeps the reply small in large designs: feature steps leave out the full body list (`created_bodies`, `changed_bodies`, `removed_bodies` stay) and sketch steps the ids they repeat outside `created`. Bridged to an app that has `engine.batch`, the whole batch is one control request (one frame of the app). Older apps, and apps showing the agent cursor, get the steps one by one. `timings: true` adds `timings: [{index, command, ms}]` for every step run, the failing one included, and `total_ms`. `profile: true` also adds each step's `profile: {boolean_ms, tessellate_ms, other_ms}`, its time in kernel booleans, in tessellation and the rest. Steps are timed where they run: in the app when bridged. An app without `engine.batch` is timed step by step, without `profile`. |
 | `inspect_design` | `measure?` (default true), `sketches?` (default true) | Design properties (`metadata`: project, author… and other tools' keys; set them with `execute` `document.metadata.set`), parameters, timeline (type, suppressed, rolled back, error, warning, timing), bodies (volume, area, centre of mass, bbox, face/edge/vertex counts, visible; `removed_later: true` while a sketch is being edited on a rolled-back timeline and a later feature deletes the body, which is then not shown), sketches (curves, points, constraints, profiles, DOF, solve status, visible), selection, undo depth. Hide helper sketches, bodies or construction planes with `execute` `browser.visibility` (`{items, visible}` or `{folder, visible}`), and joint glyphs with `{joints: [id or name], visible}` or `{folder: "joints", visible}` (a hidden joint still constrains and drives; `joint.list` reports each joint's `visible`). |

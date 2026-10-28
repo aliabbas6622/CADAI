@@ -247,6 +247,9 @@ fn the_chat_pops_out_into_its_own_window_and_docks_back() {
     h.frames(3);
     assert!(rect_of("agent_chat:panel").is_some() && rect_of("agent_chat:window").is_none(), "docked by default");
     assert!(!h.app.preferences.agent_chat_popped);
+    let options = handle_at("agent_chat:options").expect("options");
+    h.call("ui.click", json!({"x":options.x,"y":options.y}));
+    h.frames(3);
     let pop = handle_at("agent_chat:pop_out").expect("a pop-out button in the header");
     h.call("ui.click", json!({"x": pop.x, "y": pop.y}));
     h.frames(3);
@@ -256,6 +259,9 @@ fn the_chat_pops_out_into_its_own_window_and_docks_back() {
     assert_eq!(status(&h.app)["popped"], json!(true));
     // A window has its own minimise; the strip and the side drag are the docked panel's.
     assert!(handle_at("agent_chat:minimize").is_none() && handle_at("agent_chat:grip").is_none());
+    let options = handle_at("agent_chat:options").expect("options");
+    h.call("ui.click", json!({"x":options.x,"y":options.y}));
+    h.frames(3);
     let dock = handle_at("agent_chat:dock").expect("a dock button in the popped-out header");
     h.call("ui.click", json!({"x": dock.x, "y": dock.y}));
     h.frames(3);
@@ -774,6 +780,10 @@ fn choosing_a_model_sets_it_and_remembers_it() {
     assert_eq!(app.agent_chat.model, "smart");
     assert_eq!(app.preferences.agent_models.get("claude").map(String::as_str), Some("smart"));
     assert_eq!(status(&app)["model"], "smart");
+    // A late list must not revert the newer selection.
+    script.report(models_reply("fast"));
+    poll(&mut app, &ctx);
+    assert_eq!(app.agent_chat.model, "smart");
     // The agent switching its own model is shown too.
     script.report(Event::Models { current: "fast".into(), available: vec![] });
     poll(&mut app, &ctx);
@@ -1106,6 +1116,32 @@ fn narrow_chat() -> crate::scenario::Harness {
     h
 }
 
+#[test]
+fn full_ai_mode_restores_permissions_and_keeps_a_compact_chat() {
+    let mut h = narrow_chat();
+    h.app.preferences.ai_permissions = agents::Mode::Ask;
+    h.app.preferences.agent_permissions.insert("test".into(), agents::Mode::Edits);
+    h.call("ui.agent_chat", json!({"full_mode":true}));
+    assert_eq!(agents::mode_for(&h.app.preferences, "test"), agents::Mode::All);
+    h.app.agent_chat.on_event(Event::Text { thought: true, text: "Checking requested dimensions.".into() });
+    h.app.agent_chat.on_event(Event::Tool {
+        id: "check".into(),
+        title: Some("Measure design".into()),
+        kind: None,
+        status: Some(ToolStatus::Completed),
+        output: Some("Verified".into()),
+    });
+    h.frames(2);
+    assert_inside_the_panel(0);
+    assert!(crate::scenario::handle_at("agent_chat:options").is_some());
+    assert!(crate::scenario::handle_at("agent_chat:thinking:0").is_some());
+    assert!(crate::scenario::handle_at("agent_chat:activity:1").is_some());
+    assert!(crate::scenario::handle_at("agent_chat:switcher").is_none());
+    h.call("ui.agent_chat", json!({"full_mode":false}));
+    assert_eq!(agents::mode_for(&h.app.preferences, "test"), agents::Mode::Edits);
+    assert_eq!(agents::mode_for(&h.app.preferences, "other"), agents::Mode::Ask);
+}
+
 /// Every chip and the text box sit inside the panel.
 fn assert_inside_the_panel(chips: usize) {
     use crate::scenario::rect_of;
@@ -1435,7 +1471,7 @@ fn a_long_message_keeps_the_buttons_in_the_window() {
     h.app.agent_chat.input = "Please make the plate thicker and then add a fillet on every outside edge.\n".repeat(60);
     h.frames(8);
     let window = 1000.0;
-    for name in ["Send", "Attach view"] {
+    for name in ["Send", "+"] {
         let [_, y] = h.widget(name).unwrap_or_else(|| panic!("{name} is drawn"));
         assert!(y < window, "{name} is at {y}, below the window's bottom at {window}");
         // The box is pinned to the bottom and grows upwards: the buttons stay where they were

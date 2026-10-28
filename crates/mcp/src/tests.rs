@@ -87,6 +87,8 @@ fn handshake_and_tools_list() {
     let tools = call(&mut s, 4, "tools/list", json!({}));
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     for want in [
+        "guide",
+        "calculate",
         "list_commands",
         "execute",
         "batch",
@@ -120,6 +122,78 @@ fn handshake_and_tools_list() {
     assert!(d["result"]["contents"][0]["text"].as_str().unwrap().contains("timeline"));
     assert_eq!(call(&mut s, 7, "resources/read", json!({"uri": "solidcraft://nope"}))["error"]["code"], -32002);
     assert_eq!(call(&mut s, 8, "nope/nope", json!({}))["error"]["code"], -32601);
+}
+
+#[test]
+fn calculator_handles_units_and_rejects_bad_expressions() {
+    let mut s = server();
+    let before = tool(&mut s, "inspect_design", json!({"measure": false, "sketches": false}));
+    let result = tool(&mut s, "calculate", json!({"expressions": ["2 + 3 * 4", "2 ft + 300 mm", "sqrt(3^2 + 4^2)"]}));
+    assert_eq!(result["results"][0]["value"], 14.0);
+    assert_eq!(result["results"][0]["unit"], "1");
+    assert!((result["results"][1]["value"].as_f64().unwrap_or_default() - 909.6).abs() < 1e-9);
+    assert_eq!(result["results"][1]["unit"], "mm");
+    assert_eq!(result["results"][2]["value"], 5.0);
+    assert_eq!(tool(&mut s, "inspect_design", json!({"measure": false, "sketches": false})), before);
+    for expressions in [json!(["1 / 0"]), json!(["missing + 2"]), json!(vec!["1"; 21])] {
+        let bad = raw_tool(&mut s, "calculate", json!({"expressions": expressions}));
+        assert_eq!(bad["result"]["isError"], true, "{bad}");
+    }
+}
+
+#[test]
+fn calculator_chains_named_dimensions_in_one_call_without_persisting_them() {
+    let mut s = server();
+    let before = tool(&mut s, "inspect_design", json!({"measure": false, "sketches": false}));
+    let result = tool(
+        &mut s,
+        "calculate",
+        json!({"expressions": [
+            {"name":"span", "expression":"2 ft"},
+            {"name":"half", "expression":"span / 2"},
+            "half * span", "sin(90 deg)"
+        ]}),
+    );
+    assert_eq!(result["results"][1]["name"], "half");
+    assert!((result["results"][1]["value"].as_f64().unwrap() - 304.8).abs() < 1e-9);
+    assert_eq!(result["results"][1]["unit"], "mm");
+    assert!((result["results"][2]["value"].as_f64().unwrap() - 185806.08).abs() < 1e-6);
+    assert_eq!(result["results"][2]["unit"], "mm^2");
+    assert_eq!(result["results"][3]["value"], 1.0);
+    assert_eq!(tool(&mut s, "inspect_design", json!({"measure": false, "sketches": false})), before);
+    for expressions in [
+        json!(["span"]),
+        json!([{"name":"x", "expression":"later"}, {"name":"later", "expression":"1"}]),
+        json!([{"name":"x", "expression":"1"}, {"name":"x", "expression":"2"}]),
+        json!([{"name":"x", "expression":"1 mm"}, "x + 1 rad"]),
+        json!([{"name":"x", "expression":"1 / 0"}]),
+        json!([{"name":"x", "expression":"1e308 * 1e308"}]),
+        json!([{"name":"x", "expression":"1", "unit":"cm"}]),
+        json!([{"name":"x"}]),
+    ] {
+        let bad = raw_tool(&mut s, "calculate", json!({"expressions":expressions}));
+        assert!(bad["result"]["isError"] == true || bad.get("error").is_some(), "{bad}");
+    }
+    for name in ["", "1x", "a-b", "pi", "mm", "sin", &"x".repeat(65)] {
+        let bad = raw_tool(&mut s, "calculate", json!({"expressions":[{"name":name,"expression":"1"}]}));
+        assert!(bad["result"]["isError"] == true || bad.get("error").is_some(), "{bad}");
+    }
+}
+
+#[test]
+fn guide_reaches_every_client_without_changing_the_design() {
+    let mut s = server();
+    let before = tool(&mut s, "inspect_design", json!({"measure": false, "sketches": false}))["undo"].clone();
+    assert_eq!(tool(&mut s, "guide", json!({}))["topic"], "overview");
+    for topic in ["overview", "model", "edit", "verify"] {
+        let result = tool(&mut s, "guide", json!({"topic": topic}));
+        assert_eq!(result["topic"], topic);
+        assert!(result["guide"].as_str().is_some_and(|text| text.contains("measure") && text.len() < 1500), "{result}");
+    }
+    let invalid = raw_tool(&mut s, "guide", json!({"topic": "other"}));
+    assert_eq!(invalid["error"]["code"], -32602);
+    let after = tool(&mut s, "inspect_design", json!({"measure": false, "sketches": false}))["undo"].clone();
+    assert_eq!(before, after);
 }
 
 /// A URDF goes through `export` with its own options (#719).
@@ -293,6 +367,36 @@ fn parameters_drive_the_design() {
     assert!(d["params"].as_array().unwrap().iter().any(|p| p["name"] == "len" && p["value"] == 50.0), "{d}");
 }
 
+#[test]
+fn unknown_parameter_errors_explain_creation_and_batch_rollback() {
+    let mut s = server();
+    let direct = raw_tool(&mut s, "execute", json!({"command":"solid.box","params":{"length":"house_length","width":10,"height":5}}));
+    assert_eq!(direct["result"]["isError"], true, "{direct}");
+    let direct_text = direct["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(direct_text.contains("unknown parameter `house_length`"), "{direct_text}");
+    assert!(direct_text.contains("Expected parameters for `solid.box`"), "command docs remain present: {direct_text}");
+    assert!(direct_text.contains("literal value") && direct_text.contains("set_parameter"), "{direct_text}");
+
+    let batch = raw_tool(
+        &mut s,
+        "batch",
+        json!({"commands":[
+            {"command":"parameters.add","params":{"name":"batch_width","expression":"10 mm"}},
+            {"command":"solid.box","params":{"length":"batch_width","width":"house_length","height":5}}
+        ]}),
+    );
+    assert_eq!(batch["result"]["isError"], true, "{batch}");
+    let body: Value = serde_json::from_str(batch["result"]["content"][0]["text"].as_str().unwrap_or_default()).unwrap_or(Value::Null);
+    assert_eq!(body["failed"]["index"], 1, "{body}");
+    assert_eq!(body["rolled_back"], true, "{body}");
+    assert!(body["failed"]["error"].as_str().unwrap_or_default().contains("parameters created earlier in the batch"), "{body}");
+    let design = tool(&mut s, "inspect_design", json!({"measure":false,"sketches":false}));
+    assert!(
+        design["params"].as_array().is_some_and(|params| !params.iter().any(|p| p["name"] == "batch_width")),
+        "rolled-back parameter remains: {design}"
+    );
+}
+
 /// `set_parameter` takes the new value as `value` or as `expression` (the name parameters.change
 /// uses), which it used to refuse instead of forwarding.
 #[test]
@@ -301,6 +405,10 @@ fn set_parameter_takes_value_or_expression() {
     let def = tool_definitions().into_iter().find(|d| d["name"] == "set_parameter").unwrap();
     assert_eq!(def["inputSchema"]["required"], json!(["name"]), "{def}");
     assert!(def["inputSchema"]["properties"]["expression"].is_object(), "{def}");
+    assert!(
+        def["description"].as_str().unwrap_or_default().contains("Create a named parameter successfully before an expression refers to it"),
+        "{def}"
+    );
     tool(&mut s, "set_parameter", json!({"name": "len", "expression": "40 mm"}));
     tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": "len", "width": 10, "height": 10, "corner": [0, 0, 0]}}));
     assert!(rel(volume(&mut s), 4000.0) < 1e-9);
@@ -1293,14 +1401,95 @@ fn methods(b: &Recorder) -> Vec<&str> {
     b.calls.iter().map(|(m, _)| m.as_str()).collect()
 }
 
+#[test]
+fn malformed_supported_shapes_are_rejected_before_backend_calls() {
+    let mut b = Recorder { calls: Vec::new(), batch: Ok(json!({})) };
+    let cases = [
+        ("execute", json!({"command":"sketch.rectangle.two_point","params":{"p0":{"x":1},"p1":[3,4]}}), "`p0`"),
+        ("execute", json!({"command":"sketch.circle.center","params":{"center":[1,2]}}), "radius` or `diameter"),
+        ("execute", json!({"command":"sketch.line","points":{"x":1}}), "`points`"),
+        ("execute", json!({"command":"solid.box","params":{"length":1,"width":2,"height":3,"corner":[0,0]}}), "`corner`"),
+        ("batch", json!({"commands":[{"command":"sketch.line","params":{"points":{}}}]}), "`points`"),
+    ];
+    for (name, args, expected) in cases {
+        let r = crate::tools::call_tool(&mut b, name, &args);
+        assert_eq!(r["isError"], true, "{name}: {r}");
+        let text = r["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains(expected), "{r}");
+        if expected == "`corner`" {
+            assert!(text.contains("[0, 0, 0]"), "a concrete 3D point example helps repair the call: {text}");
+        }
+    }
+    assert!(b.calls.is_empty(), "malformed shapes reached the backend: {:?}", b.calls);
+}
+
+#[test]
+fn supported_shapes_keep_existing_valid_point_and_radius_forms() {
+    let mut b = Recorder { calls: Vec::new(), batch: Ok(json!({})) };
+    for (command, params) in [
+        ("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": {"x": 3, "y": 4}})),
+        ("sketch.circle.center", json!({"center": "l1.end", "radius": "5", "diameter": 10})),
+        ("sketch.circle.center", json!({"center": {"at": [0, 0]}, "radius": 5})),
+        ("solid.box", json!({"length": 1, "width": 2, "height": 3, "corner": {"x": 0, "y": 0, "z": 0}})),
+    ] {
+        let result = crate::tools::call_tool(&mut b, "execute", &json!({"command": command, "params": params}));
+        assert_ne!(result["isError"], true, "{command}: {result}");
+    }
+    assert_eq!(methods(&b), ["engine.execute"; 4]);
+}
+
+#[test]
+fn supported_command_schemas_are_exposed_in_the_catalog() {
+    let mut s = server();
+    let commands = tool(&mut s, "list_commands", json!({"filter":"sketch.rectangle.two_point"}));
+    let row = commands.as_array().and_then(|rows| rows.first()).expect("command row");
+    assert_eq!(row["shapeClass"], "point");
+    assert_eq!(row["inputSchema"]["properties"]["p0"]["anyOf"][0]["minItems"], 2);
+    assert_eq!(row["inputSchema"]["properties"]["p0"]["anyOf"][0]["maxItems"], 2);
+    assert_eq!(row["shapeClasses"]["p0"], "point");
+}
+
 /// #743: bridged to an app that has `engine.batch`, a batch is one control request.
+#[test]
+fn progressive_batch_executes_each_step_and_preserves_rollback() {
+    let (b, body, failed) = recorded_batch(
+        Ok(json!({})),
+        json!({
+            "progressive":true, "commands":[{"command":"a.one"},{"command":"a.two"}]
+        }),
+    );
+    assert!(!failed, "{body}");
+    assert_eq!(body["completed"], 2);
+    assert_eq!(methods(&b), ["engine.execute"; 4]);
+    assert_eq!(b.calls[0].1["command"], "edit.checkpoint");
+    assert_eq!(b.calls[1].1, json!({"command":"a.one","params":{},"present":true}));
+    assert_eq!(b.calls[2].1, json!({"command":"a.two","params":{},"present":true}));
+    assert_eq!(b.calls[3].1["command"], "edit.restore_checkpoint");
+    assert_eq!(b.calls[3].1["params"]["forget"], true);
+
+    let mut s = server();
+    let result = raw_tool(
+        &mut s,
+        "batch",
+        json!({"progressive":true,"commands":[
+            {"command":"parameters.add","params":{"name":"width","expression":"10 mm"}},
+            {"command":"solid.box","params":{"length":"missing_length","width":"width","height":5}}
+        ]}),
+    );
+    assert_eq!(result["result"]["isError"], true, "{result}");
+    let body: Value = serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["rolled_back"], true);
+    let design = tool(&mut s, "inspect_design", json!({"measure":false,"sketches":false}));
+    assert!(design["params"].as_array().unwrap().is_empty(), "{design}");
+}
+
 #[test]
 fn batch_is_one_engine_batch_call() {
     let reply = json!({"completed": 2, "results": [{"feature": 1, "bodies": ["B"], "created_bodies": ["B"]}, {"x": 2}], "undone": 0});
     let steps = json!([{"command": "a.one", "params": {"v": 1}}, {"command": "a.two"}]);
     let (b, body, is_error) = recorded_batch(Ok(reply.clone()), json!({"commands": steps}));
     assert_eq!(methods(&b), ["engine.batch"]);
-    assert_eq!(b.calls[0].1, json!({"commands": steps, "rollback": true}));
+    assert_eq!(b.calls[0].1, json!({"commands": [{"command":"a.one","params":{"v":1}}, {"command":"a.two","params":{}}], "rollback": true}));
     assert!(!is_error);
     assert_eq!(body, json!({"ok": true, "completed": 2, "results": reply["results"]}));
     // `verbose: false` compacts each step's result as the per-step path does.
@@ -1312,7 +1501,7 @@ fn batch_is_one_engine_batch_call() {
 fn batch_reports_a_failed_engine_batch_like_before() {
     let reply = json!({"completed": 1, "results": [{"x": 1}], "failed": {"index": 1, "command": "a.two", "error": "boom"}, "undone": 1});
     let (b, body, is_error) = recorded_batch(Ok(reply), json!({"commands": [{"command": "a.one"}, {"command": "a.two"}]}));
-    assert_eq!(methods(&b), ["engine.batch"]);
+    assert_eq!(methods(&b), ["engine.batch", "engine.commands"]);
     assert!(is_error);
     assert_eq!(
         body,
@@ -1377,7 +1566,7 @@ fn silent_app(close_first: bool) -> (String, std::sync::Arc<std::sync::Mutex<(us
                 let mut r = std::io::BufReader::new(stream);
                 let mut line = String::new();
                 while r.read_line(&mut line).is_ok_and(|n| n > 0) {
-                    if line.contains("engine.batch") {
+                    if line.contains("engine.batch") || line.contains("\"present\":true") {
                         counts.lock().unwrap().1 += 1;
                         return;
                     }
@@ -1392,18 +1581,22 @@ fn silent_app(close_first: bool) -> (String, std::sync::Arc<std::sync::Mutex<(us
 #[test]
 fn remote_engine_batch_is_not_resent_after_a_lost_reply() {
     use crate::backend::Backend;
-    for close_first in [false, true] {
-        let (addr, seen) = silent_app(close_first);
-        let mut remote = crate::Remote::connect(&addr).unwrap();
-        let r = remote.call("engine.batch", json!({"commands": [{"command": "solid.box"}]}));
-        assert!(r.is_err(), "{r:?}");
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let (connections, batches) = *seen.lock().unwrap();
-        // The connection from `connect`, and one fresh one for the batch: no resend.
-        assert_eq!(connections, 2, "close_first {close_first}: {connections} connections");
-        assert!(batches <= 1, "close_first {close_first}: the batch arrived {batches} times");
-        if !close_first {
-            assert_eq!(batches, 1);
+    for (method, params) in
+        [("engine.batch", json!({"commands": [{"command": "solid.box"}]})), ("engine.execute", json!({"command":"solid.box","present":true}))]
+    {
+        for close_first in [false, true] {
+            let (addr, seen) = silent_app(close_first);
+            let mut remote = crate::Remote::connect(&addr).unwrap();
+            let r = remote.call(method, params.clone());
+            assert!(r.is_err(), "{r:?}");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let (connections, batches) = *seen.lock().unwrap();
+            // The connection from `connect`, and one fresh one for the batch: no resend.
+            assert_eq!(connections, 2, "close_first {close_first}: {connections} connections");
+            assert!(batches <= 1, "close_first {close_first}: the batch arrived {batches} times");
+            if !close_first {
+                assert_eq!(batches, 1);
+            }
         }
     }
 }
@@ -1423,7 +1616,8 @@ fn a_bridge_made_before_the_app_runs_connects_once_it_does() {
     assert!(remote.describe().starts_with("connected to the SolidCraft app") && remote.describe().contains("not running"), "{}", remote.describe());
     let e = remote.call("engine.execute", json!({"command": "inspect.measure"})).unwrap_err();
     assert!(e.starts_with(crate::backend::NOT_RUNNING) && e.contains(&format!("solidcraft --control {port}")), "{e}");
-    let batch = crate::call_tool(&mut remote, "batch", &json!({"commands": [{"command": "solid.box"}]}));
+    let batch =
+        crate::call_tool(&mut remote, "batch", &json!({"commands": [{"command": "solid.box", "params": {"length": 1, "width": 1, "height": 1}}]}));
     let text = batch["content"][0]["text"].as_str().unwrap_or_default();
     assert_eq!(batch["isError"], true);
     assert!(text.starts_with(crate::backend::NOT_RUNNING) && !text.contains("may have run"), "{text}");
@@ -1479,7 +1673,7 @@ fn tool_annotations_tell_the_whole_truth() {
     for name in ["execute", "batch", "save", "export", "open", "screenshot"] {
         assert_eq!(hints(name), (false, true, true), "{name}");
     }
-    for name in ["list_commands", "inspect_design", "measure", "body_topology", "crash_reports"] {
+    for name in ["calculate", "list_commands", "inspect_design", "measure", "body_topology", "crash_reports"] {
         assert_eq!(hints(name), (true, false, false), "{name}");
     }
     assert_eq!(hints("new_design"), (false, true, false));

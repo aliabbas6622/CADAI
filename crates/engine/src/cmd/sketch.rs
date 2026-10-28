@@ -67,7 +67,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("circle")
         .key("C")
         .enabled(in_sketch)
-        .params(concat!("center: [x,y] or point ref, radius | diameter: number", connect_doc!(), created_doc!())),
+        .params(concat!("center: [x,y] or point ref, radius | diameter: number or length expression", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.circle.two_point", "2-Point Circle", circle_two)
         .at("SKETCH", "CREATE")
         .icon("circle2")
@@ -1115,19 +1115,19 @@ fn rect_three_point(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(result(out, info))
 }
 
-pub(super) fn radius_arg(p: &Value, cmd: &str) -> Result<f64> {
-    let r = match (num(p, "radius"), num(p, "diameter")) {
-        (Some(r), _) => r,
-        (None, Some(d)) => d / 2.0,
-        _ => return Err(bad(cmd, "needs `radius` or `diameter`")),
+pub(super) fn radius_arg(s: &Session, p: &Value, cmd: &str) -> Result<f64> {
+    let r = match (crate::params::expr(p, "radius"), crate::params::expr(p, "diameter")) {
+        (Some(e), _) => s.doc.eval(&e, solidcraft_doc::expr::Kind::Length).map_err(|err| bad(cmd, format!("radius: {err}")))?,
+        (None, Some(e)) => s.doc.eval(&e, solidcraft_doc::expr::Kind::Length).map_err(|err| bad(cmd, format!("diameter: {err}")))? / 2.0,
+        _ => return Err(bad(cmd, "needs `radius` or `diameter` as a number or length expression, e.g. {\"radius\": 5}")),
     };
-    if r > 1e-9 { Ok(r) } else { Err(bad(cmd, "radius must be positive")) }
+    if r > 1e-9 && r < 1e9 { Ok(r) } else { Err(bad(cmd, "radius must be positive and below 1e9 mm")) }
 }
 
 fn circle_center(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.circle.center";
     let p = &super::sketch_project::snap_points(s, p, cmd)?;
-    let r = radius_arg(p, cmd)?;
+    let r = radius_arg(s, p, cmd)?;
     let id = str_(p, "id").map(str::to_string);
     let (out, info) = draw(s, p, cmd, |sk, doc| {
         let c = req_parg(sk, doc, p, "center", cmd)?;
@@ -1285,7 +1285,7 @@ fn sides(p: &Value, cmd: &str) -> Result<usize> {
 fn polygon_inscribed(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.polygon.inscribed";
     let c = req_vec2(cmd, p, "center")?;
-    let r = radius_arg(p, cmd)?;
+    let r = radius_arg(s, p, cmd)?;
     let n = sides(p, cmd)?;
     let a = num(p, "angle").unwrap_or(90.0).to_radians();
     polygon(s, p, cmd, c, r, a, n, true)
@@ -1294,7 +1294,7 @@ fn polygon_inscribed(s: &mut Session, p: &Value) -> Result<Value> {
 fn polygon_circumscribed(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.polygon.circumscribed";
     let c = req_vec2(cmd, p, "center")?;
-    let r = radius_arg(p, cmd)?;
+    let r = radius_arg(s, p, cmd)?;
     let n = sides(p, cmd)?;
     let a = num(p, "angle").unwrap_or(90.0).to_radians();
     polygon(s, p, cmd, c, r / (std::f64::consts::PI / n as f64).cos(), a + std::f64::consts::PI / n as f64, n, false)

@@ -61,6 +61,7 @@ pub fn open_add(app: &mut SolveApp) {
     app.agent_chat.settings.add = Some(AddState {
         base_url: preset.map(|p| p.1.to_string()).unwrap_or_default(),
         name: preset.map(|p| p.0.to_string()).unwrap_or_default(),
+        model: preset.map(|p| p.3.to_string()).unwrap_or_default(),
         ..Default::default()
     });
 }
@@ -133,6 +134,8 @@ pub fn page(app: &mut SolveApp, ui: &mut egui::Ui) {
         crate::scenario::publish_handle("prefs:ai_toolbar_button", r.rect.center());
     });
     note(ui, tr("ui.ai_toolbar_button_note"));
+    ui.checkbox(&mut app.preferences.ai_full_mode, tr("ui.ai_full_mode"));
+    note(ui, tr("ui.ai_full_mode_note"));
     #[cfg(not(target_arch = "wasm32"))]
     {
         if app.agent_chat.detection.is_none() && app.agent_chat.detecting.is_none() {
@@ -349,10 +352,11 @@ pub fn dialog(app: &mut SolveApp, ctx: &egui::Context) {
                         s.command.clear();
                         s.name.clear();
                         if k == AddKind::Api
-                            && let Some((name, url, _)) = agents::API_PRESETS.get(s.preset)
+                            && let Some((name, url, _, model)) = agents::API_PRESETS.get(s.preset)
                         {
                             s.name = name.to_string();
                             s.base_url = url.to_string();
+                            s.model = model.to_string();
                         }
                     }
                 }
@@ -410,9 +414,10 @@ pub fn dialog(app: &mut SolveApp, ctx: &egui::Context) {
                     egui::ComboBox::from_id_salt("sc_ai_add_preset").width(200.0).selected_text(sel).show_ui(ui, |ui| {
                         for (i, p) in presets.iter().enumerate() {
                             if ui.selectable_value(&mut s.preset, i, p).clicked() {
-                                if let Some((name, url, _)) = agents::API_PRESETS.get(i) {
+                                if let Some((name, url, _, model)) = agents::API_PRESETS.get(i) {
                                     s.base_url = url.to_string();
                                     s.name = name.to_string();
+                                    s.model = model.to_string();
                                 } else {
                                     s.base_url.clear();
                                 }

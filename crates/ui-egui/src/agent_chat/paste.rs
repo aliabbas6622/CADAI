@@ -201,7 +201,8 @@ mod tests {
         std::fs::write(&spaced, b"solid").unwrap();
         let plain = d.join("brief.md");
         std::fs::write(&plain, b"x").unwrap();
-        let link = |p: &Path| format!("file://{}", p.to_string_lossy().replace(' ', "%20"));
+        let link =
+            |p: &Path| format!("file://{}{}", if cfg!(windows) { "/" } else { "" }, p.to_string_lossy().replace('\\', "/").replace(' ', "%20"));
         let list = format!("# copied\n{}\r\n{}\n", link(&spaced), link(&plain));
         assert_eq!(files_in_text(&list), vec![spaced.clone(), plain.clone()]);
         assert!(matches!(decide(Some(&list), &mut Fake::default()), Paste::Files(f) if f.len() == 2));
